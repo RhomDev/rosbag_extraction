@@ -14,18 +14,23 @@ def configuration(type_map, topic_name:str):
     return msg_type
 
 # === EXTRACTION ===
-def extration(reader, msg_type, topic_name, mode):
+def extration(reader, msg_type, topic_name, mode, nano=True):
     timestamps = []
     velocities = []
+    data_time = []
 
     while reader.has_next():
         topic, data, t = reader.read_next()
 
         if topic == topic_name:
             msg = deserialize_message(data, msg_type)
-
+            speed=0
             # temps
-            ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            if nano:
+                ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            else:
+                ts = msg.header.stamp.sec
+
 
             if mode == 0:
                 # Odometry
@@ -65,18 +70,19 @@ def saving():
     os.makedirs("../../out/save", exist_ok=True)
     plt.savefig(f"../../out/save/vitesse_{format_specifique}.png")
 
-def main(reader,type_map, topic_name, mode):
-    global data, msg_type, timestamps, velocities
+def main(bag,topic_name, mode):
+    global data, msg_type, timestamps, velocities,reader
     from tqdm import tqdm
     import time
 
     steps = ["Configuration", "Extraction", "Plot", "Sauvegarde"]
     for step in tqdm(steps, desc="Progression Traitement Vitesse", ncols=80):
         if step == "Configuration":
+            reader, topic_names, type_map = extracte_setup.configuration(bag)
             msg_type = configuration(type_map,topic_name)
             time.sleep(0.3)
         elif step == "Extraction":
-            timestamps, data_time, velocities = extration(reader, msg_type,topic_name, mode)
+            timestamps,data_time, velocities = extration(reader, msg_type,topic_name, mode)
             time.sleep(0.3)
         elif step == "Plot":
             printing(timestamps, velocities)
@@ -97,6 +103,4 @@ if __name__ == '__main__':
                         help="mode de la vitesse (0 : odometry ; 1 : wheel_steering)")
     args = parser.parse_args()
 
-    reader, topic_names, type_map = extracte_setup.configuration(args.bag)
-
-    main(reader,type_map, args.topic, args.mode)
+    main(args.bag, args.topic, args.mode)

@@ -1,5 +1,6 @@
 import traitement_img as ti
 import traitement_vitesse as tv
+import extracte_setup
 import argparse
 
 import os
@@ -14,7 +15,7 @@ def timestamp_stop_periods(data_vel):
     periods = []          # Liste finale de périodes
     current_period = []   # Sous-liste pour la période en cours
 
-    for time, speed in zip(data_vel[0], data_vel[1]):
+    for time, speed in zip(data_vel[1], data_vel[2]):
         if speed == 0.0:
             current_period.append(time)  # On ajoute le timestamp à la période en cours
         else:
@@ -51,49 +52,48 @@ def clean_photos(clean, base_dir):
         os.remove(fichier)
 
 
-def main(bag_path, topic_vel,mode):
-    config_tv = tv.configuration(bag_path, topic_vel)
-    config_ti = ti.configuration(bag_path)
+
+def filter_periods(periods, min_len=100, reduction_percent=10):
+    """Applique la réduction et filtre les périodes trop courtes."""
+    filtered = []
+    for arret in periods:
+        size = len(arret)
+        red = int(size * (reduction_percent / 100))
+        trimmed = arret[red:-red] if size > 0 else []
+        if len(trimmed) >= min_len:
+            filtered.append(trimmed)
+    return filtered
+
+
+def main(bag, topic_vel, mode):
+    reader, topic_names, type_map = extracte_setup.configuration(bag)
+    config_tv = tv.configuration(type_map, topic_vel)
+    config_ti = ti.configuration(type_map, topic_names)
 
     print("=== TRAITEMENT DES IMAGES ===")
-    ti.main(bag_path)
+    ti.main(bag, True)
 
     print("=== TRAITEMENT DE LA VITESSE ===")
-    data_vel = tv.extration(config_tv[0], config_tv[1],topic_vel, mode)
-
+    data_vel = tv.extration(reader, config_tv, topic_vel, mode, False)
 
     print("=== RECHERCHE DES ARRETS ===")
     time_stop = timestamp_stop_periods(data_vel)
 
-    clean = []
-    reduction = 10  # Exemple, adapte selon ton code
+    clean = filter_periods(time_stop)
 
-    # Boucle avec barre de progression
-    for arret in tqdm(time_stop, desc="Traitement des arrets", unit="arret"):
-        size = len(arret)
-        red = int(size * (reduction / 100))
-        if len(arret[red:-red]) < 100:
-            print("coucou")
-            continue
-        clean.append(arret[red:-red])
-
-
-
-    print("=== NETOYAGE DES PHOTOS ===")
-    for name_dir in config_ti[-1]:
-        clean_photos(clean, name_dir)
+    print("=== NETTOYAGE DES PHOTOS ===")
+    for base_dir in config_ti[-1]:
+        clean_photos(clean, base_dir)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Traitement des ROS2 bag")
-    parser.add_argument("--bag", type=str, required=True,
-                        help="Chemin du rosbag")
-
-    parser.add_argument("--topic_vel", type=str, required=True,
+    parser.add_argument("--bag", type=str, required=True, help="Chemin du rosbag")
+    parser.add_argument("--topic_vel", type=str, default="/ez10_gen1/received_raw_four_wheel_steering",
                         help="Nom du topic vitesse")
-
     parser.add_argument("--mode_vel", type=int, default=1,
-                        help="mode de la vitesse (0 : odometry ; 1 : wheel_steering)")
+                        help="Mode de la vitesse (0 : odometry ; 1 : wheel_steering)")
 
     args = parser.parse_args()
+
     main(args.bag, args.topic_vel, args.mode_vel)

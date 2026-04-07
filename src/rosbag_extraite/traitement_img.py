@@ -67,13 +67,14 @@ def clean(save_dirs: list[str]):
             os.remove(os.path.join(folder, f))
 
 # === MAIN ===
-def main(reader, topic_names, type_map, max):
+def main(bag, max):
     import time
-    global topics_list, msg_types, save_dirs
+    global topics_list, msg_types, save_dirs,reader
     # Étapes avec barre de progression globale
     steps = ["Configuration", "Extraction", "Clean"]
     for step in tqdm(steps, desc="Progression Traitement Image", ncols=80):
         if step == "Configuration":
+            reader, topic_names, type_map = extracte_setup.configuration(bag)
             topics_list, msg_types, save_dirs = configuration(type_map, topic_names)
             time.sleep(0.3)
         elif step == "Extraction":
@@ -90,6 +91,4 @@ if __name__ == "__main__":
     parser.add_argument("--clean", type=bool, default=False, help="synchronisation des images par temp de seconde")
     args = parser.parse_args()
 
-    reader, topic_names, type_map = extracte_setup.configuration(args.bag)
-
-    main(reader, topic_names, type_map, args.clean)
+    main(args.bag, args.clean)
