@@ -93,7 +93,7 @@ def main(bag, topic_vel, mode_vel):
     ti.main(bag, True)
 
     print("=== TRAITEMENT VITESSE ===")
-    data_vel = tv.extration(reader, config_tv, topic_vel, mode_vel, False)
+    data_vel = tv.extraction(reader, config_tv, topic_vel, mode_vel, False)
 
     print("=== DETECTION ARRÊTS ===")
     stop_periods = timestamp_stop_periods(data_vel)
@@ -126,4 +126,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main(args.bag, args.topic_vel, args.mode_vel)
+    main(args.bag, args.topic_vel, args.mode)

@@ -302,9 +302,9 @@ if __name__ == "__main__":
     parser.add_argument("--bag", required=True)
     parser.add_argument("--topic", default="/ez10_gen1/hesai_front/cloud")
     parser.add_argument("--angle", nargs=2, type=float, required=True)
-    parser.add_argument("--enhance", action="store_true")
+    parser.add_argument("--enchance", action="store_true")
     parser.add_argument("--video", action="store_true")
 
     args = parser.parse_args()
 
-    main(args.bag, args.topic, args.angle, args.enhance, args.video)
+    main(args.bag, args.topic, args.angle, args.enchance, args.video)
