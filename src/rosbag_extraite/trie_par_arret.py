@@ -1,98 +1,128 @@
+import os
+import glob
+import shutil
+import argparse
+
+from tqdm import tqdm
+
 import traitement_img as ti
 import traitement_vitesse as tv
 import extracte_setup
-import argparse
 
-import os
-import glob
 
-import shutil
-from tqdm import tqdm
-
-reduction = 1
-
+# =========================
+# DETECTION DES ARRÊTS
+# =========================
 def timestamp_stop_periods(data_vel):
-    periods = []          # Liste finale de périodes
-    current_period = []   # Sous-liste pour la période en cours
+    periods = []
+    current = []
 
     for time, speed in zip(data_vel[1], data_vel[2]):
         if speed == 0.0:
-            current_period.append(time)  # On ajoute le timestamp à la période en cours
+            current.append(time)
         else:
-            if current_period:           # Si on quitte une période d'arrêt
-                periods.append(current_period)  # On sauvegarde la période
-                current_period = []      # On réinitialise pour la prochaine période
+            if current:
+                periods.append(current)
+                current = []
 
-    # On ajoute la dernière période si elle se termine à la fin
-    if current_period:
-        periods.append(current_period)
+    if current:
+        periods.append(current)
 
     return periods
 
 
-def clean_photos(clean, base_dir):
-    for i, arret in enumerate(tqdm(clean, desc="Déplacement des batches", unit="batch")):
-        folder_path = os.path.join(base_dir, f"batch_{i}")
-        os.makedirs(folder_path, exist_ok=True)
-
-        for name in arret:
-            img_file = f"image_{name}.jpg"
-            img = os.path.join(base_dir, img_file)
-            folder_path_img = os.path.join(folder_path, img_file)
-
-            # Vérifie que le fichier existe
-            if not os.path.exists(img):
-                continue  # passe au suivant
-
-            # Déplace le fichier
-            shutil.move(img, folder_path_img)
-
-    remaining_files = glob.glob(os.path.join(base_dir, "image_*.jpg"))
-    for fichier in tqdm(remaining_files, desc="Suppression des images restantes", unit="fichier"):
-        os.remove(fichier)
-
-
-
+# =========================
+# FILTRAGE DES PÉRIODES
+# =========================
 def filter_periods(periods, min_len=100, reduction_percent=10):
-    """Applique la réduction et filtre les périodes trop courtes."""
     filtered = []
-    for arret in periods:
-        size = len(arret)
-        red = int(size * (reduction_percent / 100))
-        trimmed = arret[red:-red] if size > 0 else []
-        if len(trimmed) >= min_len:
-            filtered.append(trimmed)
+
+    for p in periods:
+        size = len(p)
+
+        if size == 0:
+            continue
+
+        trim = int(size * (reduction_percent / 100))
+
+        # évite slicing négatif trop agressif
+        if size > 2 * trim:
+            p = p[trim:-trim]
+
+        if len(p) >= min_len:
+            filtered.append(p)
+
     return filtered
 
 
-def main(bag, topic_vel, mode):
+# =========================
+# CLEAN IMAGES PAR BATCH
+# =========================
+def clean_batches(periods, base_dir):
+    for i, batch in enumerate(tqdm(periods, desc="Déplacement des batches")):
+
+        folder = os.path.join(base_dir, f"batch_{i}")
+        os.makedirs(folder, exist_ok=True)
+
+        for ts in batch:
+            filename = f"image_{ts}.jpg"
+            src = os.path.join(base_dir, filename)
+            dst = os.path.join(folder, filename)
+
+            if os.path.exists(src):
+                shutil.move(src, dst)
+
+    # supprimer les images restantes
+    remaining = glob.glob(os.path.join(base_dir, "image_*.jpg"))
+
+    for f in tqdm(remaining, desc="Suppression des images restantes"):
+        os.remove(f)
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
+def main(bag, topic_vel, mode_vel):
+
     reader, topic_names, type_map = extracte_setup.configuration(bag)
+
     config_tv = tv.configuration(type_map, topic_vel)
     config_ti = ti.configuration(type_map, topic_names)
 
-    print("=== TRAITEMENT DES IMAGES ===")
+    print("=== TRAITEMENT IMAGES ===")
     ti.main(bag, True)
 
-    print("=== TRAITEMENT DE LA VITESSE ===")
-    data_vel = tv.extration(reader, config_tv, topic_vel, mode, False)
+    print("=== TRAITEMENT VITESSE ===")
+    data_vel = tv.extration(reader, config_tv, topic_vel, mode_vel, False)
 
-    print("=== RECHERCHE DES ARRETS ===")
-    time_stop = timestamp_stop_periods(data_vel)
+    print("=== DETECTION ARRÊTS ===")
+    stop_periods = timestamp_stop_periods(data_vel)
 
-    clean = filter_periods(time_stop)
+    filtered = filter_periods(stop_periods)
 
-    print("=== NETTOYAGE DES PHOTOS ===")
+    print("=== ORGANISATION IMAGES ===")
+
+    # config_ti[-1] = save_dirs
     for base_dir in config_ti[-1]:
-        clean_photos(clean, base_dir)
+        clean_batches(filtered, base_dir)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Traitement des ROS2 bag")
-    parser.add_argument("--bag", type=str, required=True, help="Chemin du rosbag")
-    parser.add_argument("--topic_vel", type=str, default="/ez10_gen1/received_raw_four_wheel_steering",
-                        help="Nom du topic vitesse")
-    parser.add_argument("--mode_vel", type=int, default=1,
-                        help="Mode de la vitesse (0 : odometry ; 1 : wheel_steering)")
+# =========================
+# ENTRYPOINT
+# =========================
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Traitement ROS2 bag")
+
+    parser.add_argument("--bag", type=str, required=True)
+
+    parser.add_argument(
+        "--topic_vel",
+        type=str,
+        default="/ez10_gen1/received_raw_four_wheel_steering"
+    )
+
+    parser.add_argument("--mode", type=int, default=1)
 
     args = parser.parse_args()
 

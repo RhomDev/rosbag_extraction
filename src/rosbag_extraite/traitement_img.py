@@ -1,94 +1,137 @@
 import os
 import argparse
-
 from tqdm import tqdm
+
+import cv2
+from cv_bridge import CvBridge, CvBridgeError
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-from cv_bridge import CvBridge, CvBridgeError
-import cv2
 
 import extracte_setup
 
 bridge = CvBridge()
 
-# === CONFIGURATION TYPES ===
+
+# =========================
+# CONFIGURATION
+# =========================
 def configuration(type_map, topic_names):
     import datetime
-    maintenant = datetime.datetime.now()
-    format_specifique = maintenant.strftime("%d_%m_%Y_%H_%M_%S")
-    topic_names_image = [t for t in topic_names if t.endswith('/image_raw')]
 
-    msg_types = [get_message(type_map[name]) for name in topic_names_image]
-    save_dirs = [f"../../out/data_{format_specifique}/" + name.replace("/ez10_gen1/camera_", "", 1).replace("/image_raw", "", 1)
-                 for name in topic_names_image]
+    timestamp = datetime.datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 
-    for save in save_dirs:
-        os.makedirs(""+save, exist_ok=True)
+    image_topics = [t for t in topic_names if t.endswith("/image_raw")]
 
-    return topic_names_image, msg_types, save_dirs
+    msg_types = [get_message(type_map[t]) for t in image_topics]
 
-# === EXTRACTION DES IMAGES ===
-def extraction(reader, topics: list[str], msg_types: list, save_dirs: list[str], max:bool):
+    save_dirs = [
+        os.path.join(
+            "../../out",
+            f"data_{timestamp}",
+            t.replace("/ez10_gen1/camera_", "").replace("/image_raw", "")
+        )
+        for t in image_topics
+    ]
+
+    for d in save_dirs:
+        os.makedirs(d, exist_ok=True)
+
+    return image_topics, msg_types, save_dirs
+
+
+# =========================
+# EXTRACTION
+# =========================
+def extraction(reader, topics, msg_types, save_dirs, clean=False):
 
     messages = []
+
     while reader.has_next():
         topic, data, t = reader.read_next()
         if topic in topics:
             messages.append((topic, data))
 
-    # Parcours avec barre de progression
     for topic, data in tqdm(messages, desc="Extraction images"):
+
         idx = topics.index(topic)
-        msg = deserialize_message(data, msg_types[idx])
+        msg_type = msg_types[idx]
+
+        msg = deserialize_message(data, msg_type)
+
         try:
             cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
-            if not max:
-                filename = os.path.join(save_dirs[idx],
-                                        f"image_{msg.header.stamp.sec}_{msg.header.stamp.nanosec}.jpg")
+            stamp = msg.header.stamp
+
+            if clean:
+                filename = os.path.join(
+                    save_dirs[idx],
+                    f"image_{stamp.sec}_{stamp.nanosec}.jpg"
+                )
             else:
-                filename = os.path.join(save_dirs[idx],
-                                    f"image_{msg.header.stamp.sec}.jpg")
+                filename = os.path.join(
+                    save_dirs[idx],
+                    f"image_{stamp.sec}.jpg"
+                )
+
             cv2.imwrite(filename, cv_img)
+
         except CvBridgeError as e:
-            print(e)
+            print(f"[CvBridgeError] {e}")
 
 
-# === CLEAN DES DOSSIERS ===
-def clean(save_dirs: list[str]):
-    files_sets = [set(os.listdir(d)) for d in save_dirs]
-    common_files = set.intersection(*files_sets)
+# =========================
+# CLEAN SYNCHRO
+# =========================
+def clean(save_dirs):
+    file_sets = [set(os.listdir(d)) for d in save_dirs]
+
+    common_files = set.intersection(*file_sets)
 
     for folder in save_dirs:
-        files_to_remove = [f for f in os.listdir(folder) if f not in common_files]
-        for f in tqdm(files_to_remove, desc=f"Suppression dans {folder}"):
+        to_remove = [f for f in os.listdir(folder) if f not in common_files]
+
+        for f in tqdm(to_remove, desc=f"Cleaning {os.path.basename(folder)}"):
             os.remove(os.path.join(folder, f))
 
-# === MAIN ===
-def main(bag, max):
-    import time
-    global topics_list, msg_types, save_dirs,reader
-    # Étapes avec barre de progression globale
-    steps = ["Configuration", "Extraction", "Clean"]
-    for step in tqdm(steps, desc="Progression Traitement Image", ncols=80):
-        if step == "Configuration":
-            reader, topic_names, type_map = extracte_setup.configuration(bag)
-            topics_list, msg_types, save_dirs = configuration(type_map, topic_names)
-            time.sleep(0.3)
-        elif step == "Extraction":
-            extraction(reader, topics_list, msg_types, save_dirs, max)
-            time.sleep(0.3)
-        elif step == "Clean" and max:
-            clean(save_dirs)
-            time.sleep(0.3)
 
+# =========================
+# MAIN
+# =========================
+def main(bag, clean_mode):
+
+    steps = ["Config", "Extract", "Clean"]
+
+    for step in tqdm(steps, desc="Pipeline", ncols=80):
+
+        if step == "Config":
+            reader, topic_names, type_map = extracte_setup.configuration(bag)
+            topics, msg_types, save_dirs = configuration(type_map, topic_names)
+
+        elif step == "Extract":
+            extraction(reader, topics, msg_types, save_dirs, clean_mode)
+
+        elif step == "Clean" and clean_mode:
+            clean(save_dirs)
+
+
+# =========================
+# ENTRYPOINT
+# =========================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Traitement d'images des ROS2 bag")
-    # default="../../rosbag/ez10_gen1_sensors_2026-04-02-16-45-39"
-    parser.add_argument("--bag", type=str, required=True, help="Chemin du rosbag")
-    parser.add_argument("--clean", type=bool, default=False, help="synchronisation des images par temp de seconde")
+
+    parser = argparse.ArgumentParser(
+        description="Extraction d'images depuis un rosbag2"
+    )
+
+    parser.add_argument("--bag", type=str, required=True)
+
+    # FIX: bool argparse correct
+    parser.add_argument("--clean", action="store_true",
+                        help="Synchronisation des images (supprime non communs)")
+
     args = parser.parse_args()
 
     main(args.bag, args.clean)

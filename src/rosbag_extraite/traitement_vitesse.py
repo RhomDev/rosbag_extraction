@@ -1,106 +1,134 @@
-import rosbag2_py
-import extracte_setup
-
 import os
 import argparse
+import datetime
 
-from rclpy.serialization import deserialize_message
-from rosidl_runtime_py.utilities import get_message
+import rosbag2_py
 import matplotlib.pyplot as plt
 
-# === CONFIG ===
-def configuration(type_map, topic_name:str):
-    msg_type = get_message(type_map[topic_name])
-    return msg_type
+from tqdm import tqdm
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
 
-# === EXTRACTION ===
-def extration(reader, msg_type, topic_name, mode, nano=True):
+import extracte_setup
+
+
+# =========================
+# CONFIGURATION
+# =========================
+def configuration(type_map, topic_name: str):
+    return get_message(type_map[topic_name])
+
+
+# =========================
+# EXTRACTION
+# =========================
+def extraction(reader, msg_type, topic_name, mode, use_nanoseconds=True):
+
     timestamps = []
-    velocities = []
-    data_time = []
+    speeds = []
 
     while reader.has_next():
         topic, data, t = reader.read_next()
 
-        if topic == topic_name:
-            msg = deserialize_message(data, msg_type)
-            speed=0
-            # temps
-            if nano:
-                ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            else:
-                ts = msg.header.stamp.sec
+        if topic != topic_name:
+            continue
 
+        msg = deserialize_message(data, msg_type)
 
-            if mode == 0:
-                # Odometry
-                # vitesse (norme du vecteur linéaire)
-                vx = msg.twist.twist.linear.x
-                vy = msg.twist.twist.linear.y
-                vz = msg.twist.twist.linear.z
+        # timestamp
+        if use_nanoseconds:
+            ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        else:
+            ts = msg.header.stamp.sec
 
-                speed = (vx**2 + vy**2 + vz**2)**0.5
-            elif mode == 1:
-                speed = msg.data.speed
+        # speed computation
+        if mode == 0:
+            vx = msg.twist.twist.linear.x
+            vy = msg.twist.twist.linear.y
+            vz = msg.twist.twist.linear.z
+            speed = (vx**2 + vy**2 + vz**2) ** 0.5
 
-            timestamps.append(ts)
-            velocities.append(speed)
+        elif mode == 1:
+            speed = msg.data.speed
 
-    # === NORMALISATION TEMPS ===
+        else:
+            raise ValueError("Mode inconnu (0: odometry, 1: wheel steering)")
+
+        timestamps.append(ts)
+        speeds.append(speed)
+
+    if not timestamps:
+        return [], [], []
+
     t0 = timestamps[0]
-    data_time = timestamps
-    timestamps = [t - t0 for t in timestamps]
-    return timestamps,data_time, velocities
+    timestamps_norm = [t - t0 for t in timestamps]
 
-# === PLOT ===
-def printing(timestamps:list, velocities:list):
+    return timestamps_norm, timestamps, speeds
+
+
+# =========================
+# PLOT
+# =========================
+def plot_speed(timestamps, speeds):
     plt.figure()
-    plt.plot(timestamps, velocities, label="Vitesse")
+    plt.plot(timestamps, speeds, label="Vitesse")
+
     plt.xlabel("Temps (s)")
     plt.ylabel("Vitesse (m/s)")
-    plt.title("Evolution de la vitesse")
-    plt.grid()
+    plt.title("Évolution de la vitesse")
+    plt.grid(True)
     plt.legend()
-    plt.show()
 
-def saving():
-    import datetime
-    maintenant = datetime.datetime.now()
-    format_specifique = maintenant.strftime("%d_%m_%Y_%H_%M_%S")
-    os.makedirs("../../out/save", exist_ok=True)
-    plt.savefig(f"../../out/save/vitesse_{format_specifique}.png")
 
-def main(bag,topic_name, mode):
-    global data, msg_type, timestamps, velocities,reader
-    from tqdm import tqdm
-    import time
+def save_plot():
+    now = datetime.datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
+
+    out_dir = "../../out/save"
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.savefig(os.path.join(out_dir, f"vitesse_{now}.png"))
+
+
+# =========================
+# MAIN
+# =========================
+def main(bag, topic_name, mode):
 
     steps = ["Configuration", "Extraction", "Plot", "Sauvegarde"]
-    for step in tqdm(steps, desc="Progression Traitement Vitesse", ncols=80):
+
+    for step in tqdm(steps, desc="Pipeline vitesse", ncols=80):
+
         if step == "Configuration":
             reader, topic_names, type_map = extracte_setup.configuration(bag)
-            msg_type = configuration(type_map,topic_name)
-            time.sleep(0.3)
-        elif step == "Extraction":
-            timestamps,data_time, velocities = extration(reader, msg_type,topic_name, mode)
-            time.sleep(0.3)
-        elif step == "Plot":
-            printing(timestamps, velocities)
-            time.sleep(0.3)
-        elif step == "Sauvegarde":
-            saving()
-            time.sleep(0.3)
+            msg_type = configuration(type_map, topic_name)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Traitement de vitesse des ROS2 bag")
-    #default="../../rosbag/ez10_gen1_sensors_2026-04-02-16-45-39"
-    parser.add_argument("--bag", type=str, required=True,
-                        help="Chemin du rosbag")
-    parser.add_argument("--topic", type=str, default="/ez10_gen1/received_raw_four_wheel_steering",
-                        help="Nom des topics")
-    parser.add_argument("--mode", type=int,
-                        default="1",
-                        help="mode de la vitesse (0 : odometry ; 1 : wheel_steering)")
+        elif step == "Extraction":
+            t_norm, t_raw, speeds = extraction(reader, msg_type, topic_name, mode)
+
+        elif step == "Plot":
+            plot_speed(t_norm, speeds)
+
+        elif step == "Sauvegarde":
+            save_plot()
+
+
+# =========================
+# ENTRYPOINT
+# =========================
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Extraction vitesse ROS2 bag")
+
+    parser.add_argument("--bag", type=str, required=True)
+
+    parser.add_argument(
+        "--topic",
+        type=str,
+        default="/ez10_gen1/received_raw_four_wheel_steering"
+    )
+
+    parser.add_argument("--mode", type=int, default=1)
+
     args = parser.parse_args()
 
     main(args.bag, args.topic, args.mode)
