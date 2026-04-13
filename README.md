@@ -1,10 +1,60 @@
-# rosbag_extraction
+# 🧠 ROS2 Bag Extraction Toolkit
 
-Lancer le programme 'setup_jazzy.sh' pour une initialisation du virtual_venv. Aprés cela vous pouvez lancer 
-les programme de traitement
+Toolkit Python pour extraire, traiter et organiser des données issues de rosbag2 (ROS2).
 
-vous avez 'traitement_img.py' pour la récupération des images d'un rosbag. entrée le chemin du bag dans l'argument --bag.
-Pour le organisation des images, vous pouvez les synchroniser le systeme clean qui permet de retirer les image qui 
-ne sont pas capture dans les meme temps
+Ce projet permet de manipuler plusieurs types de capteurs :
 
-vous avez 'traitement_vitesse.py' pour la récupération des vitesses d'un rosbag.
+- 📷 Images multi-caméras  
+- 🚗 Vitesse véhicule  
+- ☁️ LiDAR (PointCloud2)  
+- 🛑 Détection d’arrêts + tri automatique des images  
+
+---
+
+## 🚀 Fonctionnalités
+
+### 📷 Extraction d’images
+- Détection automatique des topics `/image_raw`
+- Export en `.jpg`
+- Organisation par caméra
+- Synchronisation inter-caméras (`--clean`)
+
+---
+
+### 🚗 Analyse de vitesse
+- Extraction depuis :
+  - Odometry (`twist`)
+  - Wheel steering
+- Calcul de vitesse scalaire
+- Visualisation avec graphique temporel
+- Export en image (`.png`)
+
+---
+
+### ☁️ Traitement LiDAR
+- Lecture de `PointCloud2`
+- Filtrage angulaire et distance
+- Transformation (translation + rotation)
+- Projection en image 2D
+- Amélioration visuelle (denoise, contraste, colormap)
+- Génération de vidéo `.mp4`
+
+---
+
+### 🛑 Détection d’arrêts (feature avancée)
+- Détection automatique des périodes à vitesse nulle
+- Filtrage des périodes (durée minimale)
+- Découpage des images en **batches d’arrêt**
+- Organisation automatique des datasets
+
+---
+
+## 📦 Installation
+
+```bash
+git clone https://github.com/RhomDev/rosbag_extraction.git
+cd rosbag_extraction
+source setup.sh
+```
+
+

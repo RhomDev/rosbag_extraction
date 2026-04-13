@@ -80,8 +80,8 @@ def read_data_lidar(msg):
     }
 
 
-def transform_data(pc, tx=0.0, ty=0.0, tz=0.0,
-                   rx=0.0, ry=0.0, rz=0.0):
+def transform_data(pc, tx, ty, tz,
+                   rx, ry, rz):
 
     x, y, z = pc['x'] + tx, pc['y'] + ty, pc['z'] + tz
 
@@ -236,7 +236,7 @@ def generate_video():
 # =========================
 # MAIN
 # =========================
-def main(bag: str, topic_name: str, angle, enhance, video):
+def main(bag: str, topic_name: str, angle, enhance, video, translation, rotation):
 
     output_dir = Path("../../out/save_image_lidar")
     reader, topic_names, type_map = extracte_setup.configuration(bag)
@@ -266,10 +266,8 @@ def main(bag: str, topic_name: str, angle, enhance, video):
 
         pc = transform_data(
             pc,
-            1.460, 0.010, 1.920,
-            np.deg2rad(15.756),
-            np.deg2rad(-0.229),
-            np.deg2rad(3.908)
+            translation[0],translation[1],translation[2],
+            np.deg2rad(rotation[0]),  np.deg2rad(rotation[1]),  np.deg2rad(rotation[2])
         )
 
         img = pointcloud_to_image_face(pc, 1280, 720)
@@ -292,7 +290,6 @@ def main(bag: str, topic_name: str, angle, enhance, video):
     if video:
         generate_video()
 
-
 # =========================
 # ENTRYPOINT
 # =========================
@@ -302,9 +299,11 @@ if __name__ == "__main__":
     parser.add_argument("--bag", required=True)
     parser.add_argument("--topic", default="/ez10_gen1/hesai_front/cloud")
     parser.add_argument("--angle", nargs=2, type=float, required=True)
+    parser.add_argument("--transf_trans", type=float, nargs=3,default=(1.460, 0.010, 1.920))
+    parser.add_argument("--transf_rot", type=float, nargs=3, default=(15.756, -0.229, 3.908))
     parser.add_argument("--enchance", action="store_true")
     parser.add_argument("--video", action="store_true")
 
     args = parser.parse_args()
 
-    main(args.bag, args.topic, args.angle, args.enchance, args.video)
+    main(args.bag, args.topic, args.angle, args.enchance, args.video, args.transf_trans, args.transf_rot)
