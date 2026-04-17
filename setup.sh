@@ -1,84 +1,144 @@
 #!/usr/bin/env bash
 
-set -e  # stop si erreur
-
-echo "=== SETUP ENV ==="
+set -euo pipefail  # Arrêt sur erreur, variable non définie, échec pipeline
 
 # =========================
-# DETECTION ROS2
+# Couleurs pour les messages
 # =========================
-if [ -z "$ROS_DISTRO" ]; then
-    echo "ROS_DISTRO non défini → tentative de détection..."
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# =========================
+# Répertoire du script
+# =========================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || error "Impossible d'accéder au répertoire du script"
+
+info "=== SETUP ENV ==="
+info "Répertoire de travail : $SCRIPT_DIR"
+
+# =========================
+# Vérification de Python
+# =========================
+if ! command -v python3 &> /dev/null; then
+    error "python3 n'est pas installé"
+fi
+PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+info "Python détecté : version $PY_VERSION"
+
+# =========================
+# Détection ROS2
+# =========================
+if [ -z "${ROS_DISTRO:-}" ]; then
+    warn "ROS_DISTRO non défini → tentative de détection..."
     if [ -d "/opt/ros" ]; then
         ROS_DISTRO=$(ls /opt/ros | head -n 1)
-        echo "ROS détecté: $ROS_DISTRO"
+        [ -z "$ROS_DISTRO" ] && error "Aucune installation ROS2 trouvée dans /opt/ros"
+        info "ROS2 détecté : $ROS_DISTRO"
     else
-        echo "❌ ROS2 non trouvé dans /opt/ros"
-        exit 1
+        error "Dossier /opt/ros introuvable. ROS2 est-il installé ?"
     fi
 fi
 
-# Source ROS2
-source /opt/ros/$ROS_DISTRO/setup.bash
-
-# =========================
-# WORKSPACE (optionnel)
-# =========================
-WS_PATH=~/Documents/stage/ropradeau_ws_extrait
-
-if [ -f "$WS_PATH/install/setup.bash" ]; then
-    echo "Sourcing workspace..."
-    source "$WS_PATH/install/setup.bash"
+# Chemin du setup.bash système
+ROS_SETUP="/opt/ros/$ROS_DISTRO/setup.bash"
+if [ ! -f "$ROS_SETUP" ]; then
+    error "Fichier setup.bash introuvable : $ROS_SETUP"
 fi
 
+# Prévention des erreurs "unbound variable" dans les scripts ROS2
+export AMENT_TRACE_SETUP_FILES=""
+export AMENT_PYTHON_EXECUTABLE="$(which python3)"
+export COLCON_TRACE=""
+export ROS_PYTHON_VERSION="3"
+
+# Sourçage de ROS2
+source "$ROS_SETUP"
+info "ROS2 sourcé depuis $ROS_SETUP"
+
 # =========================
-# VENV
+# Environnement virtuel Python
 # =========================
-VENV_DIR=".venv"
+VENV_DIR="${VENV_DIR:-.venv}"
+VENV_PATH="$SCRIPT_DIR/$VENV_DIR"
 
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Création du virtualenv..."
-    python3 -m venv $VENV_DIR
+create_venv() {
+    info "Création du virtualenv dans $VENV_PATH"
+    python3 -m venv "$VENV_PATH" || error "Échec de création du virtualenv"
+    source "$VENV_PATH/bin/activate"
 
-    source $VENV_DIR/bin/activate
+    info "Mise à jour de pip"
+    pip install --upgrade pip setuptools wheel
 
-    echo "Upgrade pip..."
-    pip install --upgrade pip
-
-    # Optionnel : requirements.txt
-    if [ -f "requirements.txt" ]; then
-        echo "Installation requirements..."
-        pip install -r requirements.txt
+    if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+        info "Installation des dépendances depuis requirements.txt"
+        pip install -r requirements.txt || warn "Certaines dépendances n'ont pas pu être installées"
+    else
+        warn "Fichier requirements.txt absent, aucune dépendance automatique"
     fi
+}
+
+if [ ! -d "$VENV_PATH" ]; then
+    create_venv
 else
-    echo "Activation du virtualenv..."
-    source $VENV_DIR/bin/activate
+    info "Activation du virtualenv existant : $VENV_PATH"
+    source "$VENV_PATH/bin/activate"
+    if [ "${RECREATE_VENV:-0}" = "1" ]; then
+        warn "RECREATE_VENV=1 : suppression et recréation du virtualenv"
+        rm -rf "$VENV_PATH"
+        create_venv
+    fi
 fi
 
 # =========================
-# PYTHONPATH CLEAN (auto)
+# Configuration PYTHONPATH (uniquement ROS2 système)
 # =========================
-echo "Configuration PYTHONPATH..."
-
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-
-ROS_PY="/opt/ros/$ROS_DISTRO/lib/python$PY_VER/site-packages"
-WS_PY="$WS_PATH/install/lib/python$PY_VER/site-packages"
+info "Configuration PYTHONPATH..."
+ROS_PY="/opt/ros/$ROS_DISTRO/lib/python$PY_VERSION/site-packages"
 
 if [ -d "$ROS_PY" ]; then
-    export PYTHONPATH=$PYTHONPATH:$ROS_PY
+    export PYTHONPATH="$ROS_PY${PYTHONPATH:+:$PYTHONPATH}"
+    info "Ajout de $ROS_PY au PYTHONPATH"
+else
+    warn "Chemin ROS2 introuvable : $ROS_PY"
 fi
 
-if [ -d "$WS_PY" ]; then
-    export PYTHONPATH=$PYTHONPATH:$WS_PY
+# Suppression des doublons éventuels (simple nettoyage)
+clean_path() {
+    echo -n "$1" | awk -v RS=':' -v ORS=':' '!a[$0]++' | sed 's/:$//'
+}
+export PYTHONPATH=$(clean_path "$PYTHONPATH")
+
+# =========================
+# Aller dans le dossier src/rosbag_extraite (si existant)
+# =========================
+TARGET_DIR="$SCRIPT_DIR/src/rosbag_extraite"
+if [ -d "$TARGET_DIR" ]; then
+    cd "$TARGET_DIR" || error "Impossible d'accéder à $TARGET_DIR"
+    info "Répertoire de travail actuel : $(pwd)"
+else
+    warn "Dossier $TARGET_DIR introuvable, reste dans $SCRIPT_DIR"
 fi
 
 # =========================
-# WORKDIR
+# Résumé final
 # =========================
-cd src/rosbag_extraite || exit
+info "✅ Environnement prêt"
+info "ROS_DISTRO     = $ROS_DISTRO"
+info "Python version = $(python --version 2>&1)"
+info "Virtualenv     = $VIRTUAL_ENV"
+info "PYTHONPATH     = $PYTHONPATH"
 
-echo "✅ ENV prêt"
-echo "ROS_DISTRO=$ROS_DISTRO"
-echo "Python=$(python --version)"
+# =========================
+# Option : lancer un shell interactif
+# =========================
+if [ "${START_SHELL:-0}" = "1" ]; then
+    info "Lancement d'un shell interactif (tapez exit pour revenir)"
+    exec "${SHELL:-bash}"
+fi
