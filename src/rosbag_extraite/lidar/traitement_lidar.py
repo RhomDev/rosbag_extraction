@@ -20,7 +20,7 @@ import extracte_setup
 # CONFIGURATION
 # =========================
 def configuration(type_map, topic_name: str):
-    root = Path("../../out/save_image_lidar")
+    root = Path("../../../out/save_image_lidar")
 
     shutil.rmtree(root, ignore_errors=True)
     (root / "face").mkdir(parents=True, exist_ok=True)
@@ -199,8 +199,8 @@ def pointcloud_to_image_face(pc, width, height, point_size=2):
 # VIDEO
 # =========================
 def generate_video():
-    folder = Path("../../out/save_image_lidar/face")
-    out = Path("../../out/save_image_lidar/video")
+    folder = Path("../../../out/save_image_lidar/face")
+    out = Path("../../../out/save_image_lidar/video")
 
     images = sorted([f for f in os.listdir(folder)
                      if f.endswith((".png", ".jpg"))])
@@ -238,7 +238,7 @@ def generate_video():
 # =========================
 def main(bag: str, topic_name: str, angle, enhance, video, translation, rotation):
 
-    output_dir = Path("../../out/save_image_lidar")
+    output_dir = Path("../../../out/save_image_lidar")
     reader, topic_names, type_map = extracte_setup.configuration(bag)
 
     msg_type = configuration(type_map, topic_name)

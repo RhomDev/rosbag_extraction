@@ -19,7 +19,7 @@ import extracte_setup
 # ==================
 
 def configuration(type_map, topic_name: str):
-    root = Path("../../out/save_image_lidar")
+    root = Path("../../../out/save_image_lidar")
 
     shutil.rmtree(root, ignore_errors=True)
     (root / "face").mkdir(parents=True, exist_ok=True)

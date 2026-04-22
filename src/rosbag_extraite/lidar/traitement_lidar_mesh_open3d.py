@@ -20,7 +20,7 @@ import extracte_setup
 #   CONFIGURATION
 # ==================
 
-ROOT = Path("../../out/save_mesh")
+ROOT = Path("../../../out/save_mesh")
 
 # Paramètres de filtrage spatial (à adapter à votre scène)
 Z_MIN, Z_MAX     = -2.0, 5.0      # Hauteur min/max (élimine sol bruité + toit trop haut)

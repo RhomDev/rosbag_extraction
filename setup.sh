@@ -29,6 +29,7 @@ info "Répertoire de travail : $SCRIPT_DIR"
 if ! command -v python3 &> /dev/null; then
     error "python3 n'est pas installé"
 fi
+
 PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 info "Python détecté : version $PY_VERSION"
 
@@ -46,24 +47,23 @@ if [ -z "${ROS_DISTRO:-}" ]; then
     fi
 fi
 
-# Chemin du setup.bash système
 ROS_SETUP="/opt/ros/$ROS_DISTRO/setup.bash"
 if [ ! -f "$ROS_SETUP" ]; then
     error "Fichier setup.bash introuvable : $ROS_SETUP"
 fi
 
-# Prévention des erreurs "unbound variable" dans les scripts ROS2
+# Prévention ROS2
 export AMENT_TRACE_SETUP_FILES=""
 export AMENT_PYTHON_EXECUTABLE="$(which python3)"
 export COLCON_TRACE=""
 export ROS_PYTHON_VERSION="3"
 
-# Sourçage de ROS2
+# Sourcing ROS2
 source "$ROS_SETUP"
 info "ROS2 sourcé depuis $ROS_SETUP"
 
 # =========================
-# Environnement virtuel Python
+# Virtualenv Python
 # =========================
 VENV_DIR="${VENV_DIR:-.venv}"
 VENV_PATH="$SCRIPT_DIR/$VENV_DIR"
@@ -77,68 +77,68 @@ create_venv() {
     pip install --upgrade pip setuptools wheel
 
     if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-        info "Installation des dépendances depuis requirements.txt"
-        pip install -r requirements.txt || warn "Certaines dépendances n'ont pas pu être installées"
+        info "Installation des dépendances"
+        pip install -r requirements.txt || warn "Certaines dépendances ont échoué"
     else
-        warn "Fichier requirements.txt absent, aucune dépendance automatique"
+        warn "requirements.txt absent"
     fi
 }
 
 if [ ! -d "$VENV_PATH" ]; then
     create_venv
 else
-    info "Activation du virtualenv existant : $VENV_PATH"
     source "$VENV_PATH/bin/activate"
     if [ "${RECREATE_VENV:-0}" = "1" ]; then
-        warn "RECREATE_VENV=1 : suppression et recréation du virtualenv"
+        warn "RECREATE_VENV=1 → recréation venv"
         rm -rf "$VENV_PATH"
         create_venv
     fi
 fi
 
 # =========================
-# Configuration PYTHONPATH (uniquement ROS2 système)
+# PYTHONPATH (IMPORTANT)
 # =========================
 info "Configuration PYTHONPATH..."
+
+# priorité projet
+export PYTHONPATH="$SCRIPT_DIR/src"
+
+# ajout ROS2 si dispo
 ROS_PY="/opt/ros/$ROS_DISTRO/lib/python$PY_VERSION/site-packages"
 
 if [ -d "$ROS_PY" ]; then
-    export PYTHONPATH="$ROS_PY${PYTHONPATH:+:$PYTHONPATH}"
-    info "Ajout de $ROS_PY au PYTHONPATH"
+    export PYTHONPATH="$PYTHONPATH:$ROS_PY"
+    info "Ajout ROS2 PYTHONPATH"
 else
-    warn "Chemin ROS2 introuvable : $ROS_PY"
+    warn "ROS2 python path introuvable : $ROS_PY"
 fi
 
-# Suppression des doublons éventuels (simple nettoyage)
-clean_path() {
-    echo -n "$1" | awk -v RS=':' -v ORS=':' '!a[$0]++' | sed 's/:$//'
-}
-export PYTHONPATH=$(clean_path "$PYTHONPATH")
-
 # =========================
-# Aller dans le dossier src/rosbag_extraite (si existant)
+# Aller dans le projet
 # =========================
 TARGET_DIR="$SCRIPT_DIR/src/rosbag_extraite"
+
 if [ -d "$TARGET_DIR" ]; then
     cd "$TARGET_DIR" || error "Impossible d'accéder à $TARGET_DIR"
-    info "Répertoire de travail actuel : $(pwd)"
+    info "Répertoire courant : $(pwd)"
 else
-    warn "Dossier $TARGET_DIR introuvable, reste dans $SCRIPT_DIR"
+    warn "Dossier rosbag_extraite introuvable"
 fi
 
 # =========================
-# Résumé final
+# Résumé
 # =========================
 info "✅ Environnement prêt"
 info "ROS_DISTRO     = $ROS_DISTRO"
-info "Python version = $(python --version 2>&1)"
+info "Python version = $(python3 --version)"
 info "Virtualenv     = $VIRTUAL_ENV"
 info "PYTHONPATH     = $PYTHONPATH"
 
 # =========================
-# Option : lancer un shell interactif
+# Shell interactif (SAFE)
 # =========================
 if [ "${START_SHELL:-0}" = "1" ]; then
-    info "Lancement d'un shell interactif (tapez exit pour revenir)"
-    exec "${SHELL:-bash}"
+    info "Shell interactif"
+    stty sane 2>/dev/null || true
+    "${SHELL:-bash}"
 fi
