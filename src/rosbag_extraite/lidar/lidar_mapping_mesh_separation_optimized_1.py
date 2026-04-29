@@ -115,29 +115,17 @@ TOPIC_GNSS        = "/ez10_gen1/gnss_main/pose_lpz"
 TOPIC_FWS         = "/ez10_gen1/received_raw_four_wheel_steering"
 
 OUTPUT_DIR    = Path("../../../out/save_mesh")
-MIN_SPEED_MS  = 1.0      # seuil de mouvement (m/s)
+MIN_SPEED_MS  = 0.5
 VOXEL_SIZE    = 0.05
 POISSON_DEPTH = 10
 NORMAL_RADIUS = 0.2
 
-SCAN_WHEN_MOVING = True  # True = scan en mouvement, False = scan à l'arrêt
-
-# ── Calibration automatique inter-LiDAR ─────────────────────────────────
-USE_AUTO_CALIBRATION   = False    # False → extrinsèques manuels
-CALIB_FRAMES_PER_LIDAR = 40      # frames accumulées par capteur
-CALIB_VOXEL_SIZE       = 0.05    # voxel grossier pour la calibration
-ICP_MAX_ITER           = 60
-ICP_MAX_CORR_DIST      = 2.5     # distance max correspondance (m)
-ICP_RMSE_THRESHOLD     = 0.08    # seuil RMSE acceptable (m)
-# Guess initial : avant au-dessus à +1.46m, arrière à -1.46m → Δx ≈ -2.92m
-# Rotation ~180° autour de Z (capteurs opposés sur le véhicule)
-_WHEELBASE_M = 2.92
-
+SCAN_WHEN_MOVING = True
 
 # ── Paramètres d'optimisation ────────────────────────────────────────────
-CHECKPOINT_INTERVAL     = 250
-INCREMENTAL_DS_INTERVAL = 150
-MEMORY_LIMIT_GB         = 10.0
+CHECKPOINT_INTERVAL     = 200     # scans entre sauvegardes disque
+INCREMENTAL_DS_INTERVAL = 150     # scans entre voxel-DS incrémentaux
+MEMORY_LIMIT_GB         = 6.0    # seuil RAM avant DS forcé (ajuster selon machine)
 CHECKPOINT_DIR          = OUTPUT_DIR / ".checkpoints"
 
 # Calibration extrinsèque LiDAR → base véhicule
@@ -153,25 +141,6 @@ EXTRINSIC_FRONT = [1.460,  0.010, 1.920, roll_front, pitch_front, yaw_front]
 roll_rear, pitch_rear, yaw_rear = quat_to_euler(0.099, -0.080, -0.692, 0.711)
 EXTRINSIC_REAR  = [-1.460, -0.010, 1.910, roll_rear, pitch_rear, yaw_rear]
 
-LIDAR_CONFIG = {
-    "front": {
-        "topic": TOPIC_LIDAR_FRONT,
-        "extrinsic": EXTRINSIC_FRONT
-    },
-    "rear": {
-        "topic": TOPIC_LIDAR_REAR,
-        "extrinsic": EXTRINSIC_REAR
-    },
-}
-
-# ── Sélection des LiDARs actifs ────────────────────────────────────────
-# Choix possibles : "front", "rear"
-ACTIVE_LIDARS = ["front"]
-
-ACTIVE_LIDAR_TOPICS = [
-    LIDAR_CONFIG[l]["topic"]
-    for l in ACTIVE_LIDARS
-]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # MATHÉMATIQUES — matrices, transformations fusionnées
@@ -208,6 +177,7 @@ def _extract_R_t(T4x4: np.ndarray):
 # ═════════════════════════════════════════════════════════════════════════════
 # TRANSFORMATION FUSIONNÉE — 1 matmul au lieu de 3 allocations
 # ═════════════════════════════════════════════════════════════════════════════
+
 def transform_points_fused(xyz: np.ndarray,
                            pose_xyz: np.ndarray,
                            yaw_rad: float,
@@ -268,186 +238,6 @@ def transform_points_gpu(xyz: np.ndarray,
 # Sélection automatique du backend de transformation
 _transform_fn = transform_points_gpu if _DEVICE != "cpu" else transform_points_fused
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SE(3) — INTERPOLATION COMPLÈTE  (remplace la logique yaw-only)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def quat_to_rot(q) -> np.ndarray:
-    """Quaternion (objet ROS ou array [w,x,y,z]) → R 3×3 float64."""
-    if hasattr(q, 'w'):
-        w, x, y, z = q.w, q.x, q.y, q.z
-    else:
-        w, x, y, z = q[0], q[1], q[2], q[3]
-    return np.array([
-        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
-        [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
-        [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
-    ], dtype=np.float64)
-
-
-def quat_to_array(q) -> np.ndarray:
-    """ROS quaternion → [w, x, y, z] numpy."""
-    return np.array([q.w, q.x, q.y, q.z], dtype=np.float64)
-
-
-def slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
-    """
-    SLERP entre deux quaternions [w,x,y,z].
-    Gère : antipodalité, quaternions quasi-identiques, t ∈ [0,1].
-    """
-    # Assure le chemin court (hemisphere positif)
-    if np.dot(q0, q1) < 0.0:
-        q1 = -q1
-
-    dot = np.clip(np.dot(q0, q1), -1.0, 1.0)
-
-    if dot > 0.9995:                        # quasi-identiques → lerp linéaire
-        q = q0 + t * (q1 - q0)
-        return q / np.linalg.norm(q)
-
-    theta_0 = math.acos(dot)
-    theta   = theta_0 * t
-    sin_0   = math.sin(theta_0)
-
-    s0 = math.cos(theta) - dot * math.sin(theta) / sin_0
-    s1 = math.sin(theta) / sin_0
-    q  = s0 * q0 + s1 * q1
-    return q / np.linalg.norm(q)
-
-
-def make_pose(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """R (3×3) + t (3,) → matrice homogène 4×4."""
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3]  = t
-    return T
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CALIBRATION EXTRINSÈQUE AUTOMATIQUE  —  ICP point-to-plane
-# ═════════════════════════════════════════════════════════════════════════════
-# ── Calcul automatique depuis les extrinsèques connus ────────────────────
-
-_CALIB_TRANSLATION = np.array([
-    EXTRINSIC_FRONT[0] - EXTRINSIC_REAR[0],   # +2.920
-    EXTRINSIC_FRONT[1] - EXTRINSIC_REAR[1],   # +0.020
-    EXTRINSIC_FRONT[2] - EXTRINSIC_REAR[2],   # +0.010
-], dtype=np.float64)
-
-
-def _build_initial_guess() -> np.ndarray:
-    """
-    Matrice 4×4 : rear_LiDAR → front_LiDAR.
-    Translation extraite des positions capteurs réelles.
-    Rotation 180° autour de Z (capteurs opposés).
-    """
-    T = np.eye(4, dtype=np.float64)
-
-    # Rotation 180° Z (les deux LiDAR se font face)
-    T[0, 0] = -1.0
-    T[1, 1] = -1.0
-
-    # Translation exacte rear → front (dans le repère véhicule)
-    T[:3, 3] = _CALIB_TRANSLATION
-
-    print(f"  [CALIB] Initial guess : t={np.round(_CALIB_TRANSLATION, 3)} m  "
-          f"(rotation 180° Z)")
-    return T
-
-
-def estimate_extrinsic_icp(
-        front_pts: np.ndarray,
-        rear_pts:  np.ndarray,
-        voxel_size:           float = CALIB_VOXEL_SIZE,
-        max_correspondence_m: float = ICP_MAX_CORR_DIST,
-        max_iter:             int   = ICP_MAX_ITER,
-        rmse_threshold:       float = ICP_RMSE_THRESHOLD,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Estime la transformation rear_LiDAR → front_LiDAR par ICP point-to-plane.
-
-    Retourne (R 3×3, t 3-vec) tels que :
-        rear_in_front_frame = rear_pts @ R.T + t
-
-    Retourne (None, None) si ICP diverge ou RMSE > rmse_threshold.
-    """
-    import open3d as o3d
-
-    def _prepare(pts: np.ndarray, name: str):
-        """Downsample + normales."""
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-        pcd = pcd.voxel_down_sample(voxel_size)
-        if len(pcd.points) < 500:
-            raise RuntimeError(
-                f"[CALIB] Nuage {name} trop petit après DS : "
-                f"{len(pcd.points)} pts — augmenter CALIB_FRAMES_PER_LIDAR")
-        pcd.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(
-                radius=voxel_size * 3, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(30)
-        return pcd
-
-    try:
-        pcd_front = _prepare(front_pts, "front")
-        pcd_rear  = _prepare(rear_pts,  "rear")
-
-        print(f"  [CALIB] ICP : front={len(pcd_front.points):,} pts | "
-              f"rear={len(pcd_rear.points):,} pts "
-              f"(après DS {voxel_size}m)")
-
-        init_T = _build_initial_guess()
-
-        # ── ICP point-to-plane ────────────────────────────────────────────
-        result = o3d.pipelines.registration.registration_icp(
-            source=pcd_rear,          # rear → à aligner
-            target=pcd_front,         # front → référence
-            max_correspondence_distance=max_correspondence_m,
-            init=init_T,
-            estimation_method=o3d.pipelines.registration
-                               .TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=max_iter,
-                relative_fitness=1e-6,
-                relative_rmse=1e-6),
-        )
-
-        fitness = result.fitness
-        rmse    = result.inlier_rmse
-        T_icp   = result.transformation   # 4×4 float64
-
-        print(f"  [CALIB] ICP terminé — fitness={fitness:.4f} | "
-              f"RMSE={rmse:.4f} m | "
-              f"seuil={rmse_threshold} m")
-
-        # ── Validation ────────────────────────────────────────────────────
-        if fitness < 0.30:
-            print(f"  [CALIB][WARN] Fitness trop faible ({fitness:.3f} < 0.30) "
-                  f"→ fallback extrinsèques manuels")
-            return None, None
-
-        if rmse > rmse_threshold:
-            print(f"  [CALIB][WARN] RMSE trop élevé ({rmse:.4f} > "
-                  f"{rmse_threshold}) → fallback extrinsèques manuels")
-            return None, None
-
-        R = T_icp[:3, :3].astype(np.float64)
-        t = T_icp[:3,  3].astype(np.float64)
-
-        # Sanity-check : la rotation doit rester proche de 180°
-        cos_angle = (np.trace(R) - 1.0) / 2.0
-        angle_deg = math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
-        if not (120.0 < angle_deg < 240.0):
-            print(f"  [CALIB][WARN] Rotation ICP aberrante ({angle_deg:.1f}°) "
-                  f"→ fallback extrinsèques manuels")
-            return None, None
-
-        print(f"  [CALIB][OK] Transformation rear→front validée "
-              f"(angle={angle_deg:.1f}°, t={np.round(t, 3)})")
-        return R, t
-
-    except Exception as e:
-        print(f"  [CALIB][ERREUR] ICP échoué : {e} → fallback manuels")
-        return None, None
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TRAJECTOIRE GNSS (optimisée)
@@ -503,36 +293,6 @@ class GNSSTrajectory:
         pos   = self.positions[idx - 1] + alpha * (self.positions[idx] - self.positions[idx - 1])
         q     = self.quaternions[idx - 1] if alpha < 0.5 else self.quaternions[idx]
         return pos, self._quat_to_yaw(q)
-
-    def interpolate_pose_se3(self, query_ts_ns: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Retourne (position_xyz, quaternion_wxyz) interpolés."""
-        t = query_ts_ns * 1e-9
-        ts = self.timestamps
-
-        if t < ts[0] or t > ts[-1]:
-            return None, None
-
-        idx = np.searchsorted(ts, t)
-        if idx == 0:
-            return self.positions[0].copy(), self._quat_to_array(self.quaternions[0])
-        if idx >= len(ts):
-            return self.positions[-1].copy(), self._quat_to_array(self.quaternions[-1])
-
-        alpha = (t - ts[idx - 1]) / (ts[idx] - ts[idx - 1] + 1e-12)
-
-        # LERP linéaire pour la position
-        pos = self.positions[idx - 1] + alpha * (self.positions[idx] - self.positions[idx - 1])
-
-        # SLERP pour le quaternion
-        q0 = self._quat_to_array(self.quaternions[idx - 1])
-        q1 = self._quat_to_array(self.quaternions[idx])
-        q_interp = slerp(q0, q1, alpha)
-
-        return pos, q_interp
-
-    @staticmethod
-    def _quat_to_array(q):
-        return np.array([q.w, q.x, q.y, q.z], dtype=np.float64)
 
     def gnss_speed_at(self, query_ts_ns: int) -> float:
         t   = query_ts_ns * 1e-9
@@ -699,88 +459,6 @@ def _vectorized_fallback_xyz(msg) -> Optional[np.ndarray]:
     mask = np.isfinite(xyz).all(axis=1)
     return xyz[mask] if not mask.all() else xyz
 
-# ═══════════════════════════════════════════════════════════════════════
-# FILTRAGE DISTANCE + NETTOYAGE BRUIT
-# ═══════════════════════════════════════════════════════════════════════
-
-def filter_points_by_distance(xyz: np.ndarray,
-                               min_dist: float,
-                               max_dist: float) -> np.ndarray:
-    """
-    Filtre les points hors de la plage [min_dist, max_dist].
-    100 % vectorisé, sans sqrt (comparaison sur distances²).
-    """
-    # Évite sqrt : compare dist² directement → ~1.5× plus rapide
-    sq = np.einsum('ij,ij->i', xyz, xyz)   # (N,) — plus rapide que (xyz**2).sum(1)
-
-    min_sq = min_dist * min_dist
-    max_sq = max_dist * max_dist
-
-    # Masque booléen in-place → une seule allocation
-    mask = (sq >= min_sq) & (sq <= max_sq)
-    return xyz[mask]
-
-def remove_noise(xyz: np.ndarray,
-                 method: str = "statistical",
-                 **kwargs) -> np.ndarray:
-    """
-    Supprime le bruit du nuage de points.
-
-    Méthodes :
-      "statistical" → remove_statistical_outlier (Open3D)
-      "radius"      → remove_radius_outlier (Open3D)
-    Fallback NumPy si Open3D indisponible.
-
-    Kwargs par défaut :
-      statistical : nb_neighbors=20, std_ratio=2.0
-      radius      : nb_points=16,    radius=0.5
-    """
-    try:
-        import open3d as o3d
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(xyz)
-
-        if method == "statistical":
-            nb_neighbors = kwargs.get("nb_neighbors", 20)
-            std_ratio    = kwargs.get("std_ratio",    2.0)
-            pcd_clean, _ = pcd.remove_statistical_outlier(
-                nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-
-        elif method == "radius":
-            nb_points = kwargs.get("nb_points", 16)
-            radius    = kwargs.get("radius",    0.5)
-            pcd_clean, _ = pcd.remove_radius_outlier(
-                nb_points=nb_points, radius=radius)
-
-        else:
-            raise ValueError(f"Méthode inconnue : '{method}'. "
-                             f"Choisir 'statistical' ou 'radius'.")
-
-        # np.asarray → vue directe, pas de copie
-        result = np.asarray(pcd_clean.points, dtype=np.float32)
-        del pcd, pcd_clean
-        return result
-
-    except ImportError:
-        # ── Fallback NumPy : filtre les points isolés par densité locale ──
-        # Approximation grossière (grille 3D) — suffisant en cas de secours
-        print("[WARN] Open3D indisponible → fallback NumPy pour remove_noise")
-        return _numpy_noise_fallback(xyz, kwargs.get("std_ratio", 2.0))
-
-
-def _numpy_noise_fallback(xyz: np.ndarray, std_ratio: float = 2.0) -> np.ndarray:
-    """
-    Fallback sans Open3D.
-    Supprime les points dont la distance au centroïde dépasse
-    (mean + std_ratio × std) — O(N), très rapide.
-    Moins précis que Statistical Outlier Removal mais sans dépendance.
-    """
-    centroid = xyz.mean(axis=0)                          # (3,)
-    sq_dist  = np.einsum('ij,ij->i', xyz - centroid,
-                                     xyz - centroid)     # (N,)
-    threshold = sq_dist.mean() + std_ratio * sq_dist.std()
-    return xyz[sq_dist <= threshold]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LECTURE BAG 2 PASSES  (cœur de l'optimisation mémoire)
@@ -839,327 +517,167 @@ def read_metadata_pass(bag_path: str):
     print(f"[INFO]   GNSS={len(gnss_msgs)}, FWS={len(fws_msgs)}")
     return gnss_msgs, fws_msgs
 
-def _run_calibration_phase(
-        bag_path: str,
-        gnss_traj: GNSSTrajectory,
-        speed_tracker: FWSSpeedTracker,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Ouvre le bag, accumule CALIB_FRAMES_PER_LIDAR frames par LiDAR
-    (points bruts dans le repère capteur), puis lance estimate_extrinsic_icp.
-    """
-    from rclpy.serialization import deserialize_message
-    from rosidl_runtime_py.utilities import get_message
-
-    reader, topic_types = _open_bag_reader(
-        bag_path, [TOPIC_LIDAR_FRONT, TOPIC_LIDAR_REAR])
-    deser = {}
-    for topic in (TOPIC_LIDAR_FRONT, TOPIC_LIDAR_REAR):
-        t = topic_types.get(topic)
-        deser[topic] = get_message(t) if t else None
-
-    front_buf: List[np.ndarray] = []
-    rear_buf:  List[np.ndarray] = []
-    target = CALIB_FRAMES_PER_LIDAR
-
-    def _should_keep(is_moving):
-        return is_moving if SCAN_WHEN_MOVING else not is_moving
-
-    while reader.has_next():
-        # Arrêt dès que les deux buffers sont pleins
-        if len(front_buf) >= target and len(rear_buf) >= target:
-            break
-
-        topic, data, ts = reader.read_next()
-        d = deser.get(topic)
-        if d is None:
-            continue
-
-        # Seulement pendant le mouvement (ou l'arrêt selon config)
-        if not _should_keep(speed_tracker.is_moving(ts)):
-            continue
-        pose, _ = gnss_traj.interpolate_pose(ts)
-        if pose is None:
-            continue
-
-        msg = deserialize_message(data, d)
-        xyz = fast_pointcloud2_to_xyz(msg)
-        del msg
-        if xyz is None or len(xyz) == 0:
-            continue
-
-        # Filtrage distance (repère capteur) — même fenêtre que le pipeline
-        xyz = filter_points_by_distance(xyz, min_dist=0.5, max_dist=35.0)
-        if len(xyz) == 0:
-            continue
-
-        if topic == TOPIC_LIDAR_FRONT and len(front_buf) < target:
-            front_buf.append(xyz)
-        elif topic == TOPIC_LIDAR_REAR and len(rear_buf) < target:
-            rear_buf.append(xyz)
-
-    print(f"  [CALIB] Frames collectées : front={len(front_buf)} | "
-          f"rear={len(rear_buf)} (cible={target})")
-
-    if len(front_buf) < 5 or len(rear_buf) < 5:
-        print("  [CALIB][WARN] Pas assez de frames → calibration ignorée")
-        return None, None
-
-    front_pts = np.concatenate(front_buf, axis=0)
-    rear_pts  = np.concatenate(rear_buf,  axis=0)
-    del front_buf, rear_buf
-    _force_gc()
-
-    return estimate_extrinsic_icp(front_pts, rear_pts)
-
-
-def transform_points_with_deskew(xyz: np.ndarray,
-                                 base_ts_ns: int,
-                                 gnss_traj: GNSSTrajectory,
-                                 R_ext: np.ndarray,
-                                 t_ext: np.ndarray,
-                                 scan_duration_s: float = 0.1,
-                                 num_chunks: int = 12,
-                                 clockwise: bool = True) -> Optional[np.ndarray]:
-    """
-    Deskewing avec correction du wrap-around arctan2.
-
-    clockwise=True  → Hesai XT32/AT128 (sens horaire vu d'en haut)
-    clockwise=False → LiDAR sens trigonométrique
-    """
-    if len(xyz) == 0:
-        return xyz
-
-    # ── 1. Azimuth en [0, 2π] — élimine le wrap-around ──────────────────
-    #    arctan2 ∈ [-π, +π]  →  % (2π) ∈ [0, 2π]
-    #    Les points à ±π ne sont plus séparés artificiellement
-    angles = np.arctan2(xyz[:, 1], xyz[:, 0]) % (2.0 * np.pi)
-
-    angle_min   = float(np.min(angles))
-    angle_range = float(np.max(angles)) - angle_min
-
-    # Garde-fou : scan dégénéré (< 10° de couverture)
-    if angle_range < np.deg2rad(10.0):
-        return None
-
-    # ── 2. Fraction temporelle ────────────────────────────────────────────
-    t_frac = (angles - angle_min) / (angle_range + 1e-9)
-
-    # Hesai tourne dans le sens HORAIRE vu d'en haut :
-    # azimut décroissant dans le temps → inverser la fraction
-    if clockwise:
-        t_frac = 1.0 - t_frac
-
-    # ── 3. Indexation par chunks ──────────────────────────────────────────
-    chunks_idx = np.clip(
-        np.floor(t_frac * num_chunks).astype(np.int32),
-        0, num_chunks - 1
-    )
-
-    out_xyz    = np.empty_like(xyz)
-    valid_mask = np.zeros(len(xyz), dtype=bool)
-
-    # ── 4. Transformation par secteur ─────────────────────────────────────
-    for i in range(num_chunks):
-        mask = (chunks_idx == i)
-        if not np.any(mask):
-            continue
-
-        # Timestamp au milieu du secteur
-        chunk_t_frac = (i + 0.5) / num_chunks
-        ts_query     = base_ts_ns + int(chunk_t_frac * scan_duration_s * 1e9)
-
-        pos_base, q_base = gnss_traj.interpolate_pose_se3(ts_query)
-        if pos_base is None:
-            continue
-
-        R_base  = quat_to_rot(q_base)
-        R_total = R_base @ R_ext
-        t_total = R_base @ t_ext + pos_base
-
-        out_xyz[mask] = (xyz[mask] @ R_total.T + t_total).astype(np.float32)
-        valid_mask[mask] = True
-
-    return out_xyz[valid_mask]
-
 
 def stream_lidar_pass(bag_path: str,
                       gnss_traj: GNSSTrajectory,
                       speed_tracker: FWSSpeedTracker,
                       T_front: np.ndarray,
                       T_rear: np.ndarray) -> np.ndarray:
+    """
+    PASSE 2 — Streaming LiDAR : chaque scan est transformé puis ajouté
+    au nuage accumulé. Le message ROS est libéré immédiatement.
 
+    Inclut :
+    - Downsampling incrémental tous les INCREMENTAL_DS_INTERVAL scans
+    - Checkpoint disque tous les CHECKPOINT_INTERVAL scans
+    - Monitoring mémoire avec DS forcé si > MEMORY_LIMIT_GB
+    """
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
     import open3d as o3d
 
-    # ── Checkpoint ───────────────────────────────────────────────────────
+    # ── Vérification de checkpoint existant ──────────────────────────────
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     ckpt_path = CHECKPOINT_DIR / "accumulated_cloud.npy"
     ckpt_meta = CHECKPOINT_DIR / "accumulated_meta.npy"
     resumed_pts = _load_checkpoint(ckpt_path)
     resume_after_ts = 0
-    if resumed_pts is not None:
-        if len(resumed_pts) == 0:
-            print("  [CKPT] Checkpoint vide → ignoré")
-            resumed_pts = None
-            for f in (ckpt_path, ckpt_meta):
-                if f.exists(): f.unlink()
-        elif ckpt_meta.exists():
-            meta = np.load(str(ckpt_meta))
-            resume_after_ts = int(meta[0])
-            print(f"  [CKPT] Reprise après ts={resume_after_ts}")
+    if resumed_pts is not None and ckpt_meta.exists():
+        meta = np.load(str(ckpt_meta))
+        resume_after_ts = int(meta[0])
+        print(f"  [CKPT] Reprise après ts={resume_after_ts}")
 
-    # ── Extrinsèques par topic ────────────────────────────────────────────
-    lidar_transforms = {}
-    for name in ACTIVE_LIDARS:
-        T = extrinsic_to_matrix(LIDAR_CONFIG[name]["extrinsic"])
-        R, t = _extract_R_t(T)
-        lidar_transforms[LIDAR_CONFIG[name]["topic"]] = (R, t)
+    # ── Ouvrir le bag pour les topics LiDAR ──────────────────────────────
+    reader, topic_types = _open_bag_reader(
+        bag_path, [TOPIC_LIDAR_FRONT, TOPIC_LIDAR_REAR])
 
-    # ── Calibration automatique (si activée) ─────────────────────────────
-    if USE_AUTO_CALIBRATION and set(ACTIVE_LIDARS) == {"front", "rear"}:
-        print(f"[INFO] Phase calibration : accumulation de "
-              f"{CALIB_FRAMES_PER_LIDAR} frames par LiDAR…")
-        R_icp, t_icp = _run_calibration_phase(bag_path, gnss_traj, speed_tracker)
-        if R_icp is not None:
-            T_icp_4x4 = np.eye(4, dtype=np.float64)
-            T_icp_4x4[:3, :3] = R_icp
-            T_icp_4x4[:3,  3] = t_icp
-            T_rear_auto = T_front @ T_icp_4x4
-            R_rear_auto, t_rear_auto = _extract_R_t(T_rear_auto)
-            lidar_transforms[TOPIC_LIDAR_REAR] = (R_rear_auto, t_rear_auto)
-            print("[INFO] Extrinsèques arrière mis à jour via ICP ✓")
-        else:
-            print("[INFO] Calibration ICP échouée → extrinsèques manuels conservés")
-
-    # ── Ouverture bag ─────────────────────────────────────────────────────
-    reader, topic_types = _open_bag_reader(bag_path, ACTIVE_LIDAR_TOPICS)
     deser = {}
-    for topic in ACTIVE_LIDAR_TOPICS:
+    for topic in (TOPIC_LIDAR_FRONT, TOPIC_LIDAR_REAR):
         t = topic_types.get(topic)
         deser[topic] = get_message(t) if t else None
 
-    # ── Buffer accumulateur ───────────────────────────────────────────────
+    R_front, t_front = _extract_R_t(T_front)
+    R_rear,  t_rear  = _extract_R_t(T_rear)
+
+    # ── Accumulateur pré-alloué ──────────────────────────────────────────
+    # Commence avec un buffer de 5M points, double si nécessaire
     INIT_CAPACITY = 5_000_000
-    buf     = resumed_pts if resumed_pts is not None else \
-              np.empty((INIT_CAPACITY, 3), dtype=np.float32)
+    buf = resumed_pts if resumed_pts is not None else np.empty(
+        (INIT_CAPACITY, 3), dtype=np.float32)
     buf_idx = len(resumed_pts) if resumed_pts is not None else 0
 
-    scan_count    = 0
-    skipped_stop  = 0
+    scan_count = 0
+    skipped_stop = 0
     skipped_range = 0
-    t_start       = time.monotonic()
+    t_start = time.monotonic()
 
-    def _should_keep(is_moving: bool) -> bool:
+    def _should_keep(is_moving):
         return is_moving if SCAN_WHEN_MOVING else not is_moving
 
-    print("[INFO] Passe 2/2 — streaming LiDAR avec deskewing SE(3)…")
+    print("[INFO] Passe 2/2 — streaming LiDAR + transformation…")
 
     while reader.has_next():
-        topic, data, ts_msg = reader.read_next()
+        topic, data, ts = reader.read_next()
 
-        # ── Filtre topic ──────────────────────────────────────────────────
+        # Skip scans déjà dans le checkpoint
+        if ts <= resume_after_ts:
+            continue
+
         d = deser.get(topic)
         if d is None:
             continue
 
-        # ── Filtre timestamp (reprise checkpoint) ─────────────────────────
-        if ts_msg <= resume_after_ts:
-            continue
-
-        # ── Filtre vitesse ────────────────────────────────────────────────
-        if not _should_keep(speed_tracker.is_moving(ts_msg)):
+        # Filtre mouvement
+        if not _should_keep(speed_tracker.is_moving(ts)):
             skipped_stop += 1
             continue
 
-        # ── Filtre GNSS (vérification rapide de la plage) ─────────────────
-        pose_check, _ = gnss_traj.interpolate_pose(ts_msg)
-        if pose_check is None:
+        # Pose interpolée
+        pose, yaw = gnss_traj.interpolate_pose(ts)
+        if pose is None:
             skipped_range += 1
             continue
 
-        # ── Extrinsèque du LiDAR courant ──────────────────────────────────
-        if topic not in lidar_transforms:
-            continue
-        R_ext, t_ext = lidar_transforms[topic]
-
-        # ── Désérialisation (une seule fois) ──────────────────────────────
+        # Désérialisation → transformation (le message est GC-able après)
         msg = deserialize_message(data, d)
         xyz = fast_pointcloud2_to_xyz(msg)
-        del msg
+        del msg  # libère la mémoire du message immédiatement
 
         if xyz is None or len(xyz) == 0:
             continue
 
-        # ── Filtrage distance (repère capteur) ────────────────────────────
-        xyz = filter_points_by_distance(xyz, min_dist=0.5, max_dist=35.0)
-        if len(xyz) == 0:
-            continue
+        # Sélection extrinsèque
+        if topic == TOPIC_LIDAR_FRONT:
+            R_ext, t_ext = R_front, t_front
+        else:
+            R_ext, t_ext = R_rear, t_rear
 
-        # ── Transformation avec deskewing SE(3) ───────────────────────────
-        #    Remplace transform_points_fused — corrige la distorsion en virage
-        pts = transform_points_with_deskew(
-            xyz=xyz,
-            base_ts_ns=ts_msg,
-            gnss_traj=gnss_traj,
-            R_ext=R_ext,
-            t_ext=t_ext,
-            scan_duration_s=0.1,
-            num_chunks=12,
-            clockwise=True,
-        )
-        del xyz
+        # Transformation fusionnée (CPU ou GPU)
+        pts = _transform_fn(xyz, pose, yaw, R_ext, t_ext)
+        del xyz  # libère
 
-        if pts is None or len(pts) == 0:
-            continue
-
-        # ── Insertion dans le buffer ──────────────────────────────────────
+        # ── Ajout au buffer pré-alloué ───────────────────────────────────
         n_new = len(pts)
         if buf_idx + n_new > len(buf):
+            # Agrandit le buffer (×1.5 pour amortir les réallocations)
             new_cap = max(len(buf) + n_new, int(len(buf) * 1.5))
             new_buf = np.empty((new_cap, 3), dtype=np.float32)
             new_buf[:buf_idx] = buf[:buf_idx]
             buf = new_buf
+
         buf[buf_idx:buf_idx + n_new] = pts
-        buf_idx    += n_new
+        buf_idx += n_new
         scan_count += 1
 
-        # ── Downsampling incrémental ──────────────────────────────────────
+        # ── Downsampling incrémental périodique ──────────────────────────
         if scan_count % INCREMENTAL_DS_INTERVAL == 0:
             mem_gb = _mem_used_gb()
-            if mem_gb > MEMORY_LIMIT_GB:
-                print(f"  [MEM] {mem_gb:.1f} Go → DS forcé")
-            pcd_tmp = o3d.geometry.PointCloud()
-            pcd_tmp.points = o3d.utility.Vector3dVector(buf[:buf_idx])
-            pcd_ds  = pcd_tmp.voxel_down_sample(voxel_size=VOXEL_SIZE)
-            ds_pts  = np.asarray(pcd_ds.points).astype(np.float32)
-            buf_idx = len(ds_pts)
-            if buf_idx > len(buf):
-                buf = np.empty((buf_idx + INIT_CAPACITY, 3), dtype=np.float32)
-            buf[:buf_idx] = ds_pts
-            del pcd_tmp, pcd_ds, ds_pts
-            _force_gc()
-            elapsed = time.monotonic() - t_start
-            print(f"  [DS]  scan {scan_count:,} | {buf_idx:,} pts "
-                  f"| {scan_count/elapsed:.0f} scans/s | {_mem_used_gb():.1f} Go")
+            force_ds = mem_gb > MEMORY_LIMIT_GB
 
-        # ── Checkpoint périodique ─────────────────────────────────────────
+            if force_ds:
+                print(f"  [MEM] {mem_gb:.1f} Go utilisés → downsampling forcé")
+
+            if force_ds or scan_count % INCREMENTAL_DS_INTERVAL == 0:
+                pcd_tmp = o3d.geometry.PointCloud()
+                pcd_tmp.points = o3d.utility.Vector3dVector(buf[:buf_idx])
+                pcd_ds = pcd_tmp.voxel_down_sample(voxel_size=VOXEL_SIZE)
+                ds_pts = np.asarray(pcd_ds.points).astype(np.float32)
+
+                # Réécrit le buffer avec les points downsampleés
+                buf_idx = len(ds_pts)
+                if buf_idx > len(buf):
+                    buf = np.empty((buf_idx + INIT_CAPACITY, 3), dtype=np.float32)
+                buf[:buf_idx] = ds_pts
+
+                del pcd_tmp, pcd_ds, ds_pts
+                _force_gc()
+
+                elapsed = time.monotonic() - t_start
+                rate = scan_count / elapsed if elapsed > 0 else 0
+                print(f"  [DS]  scan {scan_count:,} | {buf_idx:,} pts "
+                      f"| {rate:.0f} scans/s | RSS {_mem_used_gb():.1f} Go")
+
+        # ── Checkpoint périodique ────────────────────────────────────────
         if scan_count % CHECKPOINT_INTERVAL == 0:
             _save_checkpoint(buf[:buf_idx], ckpt_path, f"scan {scan_count}")
-            np.save(str(ckpt_meta), np.array([ts_msg], dtype=np.int64))
+            np.save(str(ckpt_meta), np.array([ts], dtype=np.int64))
 
+    # ── Résumé final ─────────────────────────────────────────────────────
     elapsed = time.monotonic() - t_start
     print(f"[INFO] Streaming terminé : {scan_count:,} scans en {elapsed:.1f}s "
-          f"({scan_count / max(elapsed, 1e-6):.0f} scans/s)")
+          f"({scan_count/elapsed:.0f} scans/s)")
     print(f"[INFO]   {skipped_stop} ignorés (arrêt) | "
-          f"{skipped_range} hors plage GNSS | {buf_idx:,} pts accumulés")
+          f"{skipped_range} ignorés (hors plage GNSS)")
+    print(f"[INFO]   Nuage accumulé : {buf_idx:,} points")
 
+    # Sauvegarde finale
     result = buf[:buf_idx].copy()
     del buf
     _force_gc()
+
     _save_checkpoint(result, ckpt_path, "final")
     return result
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SEGMENTATION SOL (inchangée)
@@ -1181,7 +699,7 @@ def segment_ground(pcd, distance_threshold=0.2, ransac_n=3, num_iterations=1000)
 # CONSTRUCTION MESH  (avec GC inter-étapes)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def build_mesh(combined_pts: np.ndarray, output_dir: Path, ground:bool) -> None:
+def build_mesh(combined_pts: np.ndarray, output_dir: Path) -> None:
     import open3d as o3d
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1210,7 +728,7 @@ def build_mesh(combined_pts: np.ndarray, output_dir: Path, ground:bool) -> None:
     print(f"[INFO] Après filtre outliers : {len(pcd_clean.points):,} points")
 
     # ── Sauvegarde nuage nettoyé ─────────────────────────────────────────
-    cloud_path = output_dir / f"output_cloud_{'Sol' if ground else 'Non-Sol'}_{now}.ply"
+    cloud_path = output_dir / f"output_cloud_{now}.ply"
     o3d.io.write_point_cloud(str(cloud_path), pcd_clean)
     print(f"[OK]   Nuage enregistré → {cloud_path}")
 
@@ -1272,8 +790,6 @@ def _visualize(mesh):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-
-
     t_pipeline = time.monotonic()
 
     bag = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else BAG_PATH)
@@ -1284,7 +800,6 @@ def main():
     print(f"  Bag          : {bag}")
     print(f"  LiDAR avant  : {TOPIC_LIDAR_FRONT}")
     print(f"  LiDAR arrière: {TOPIC_LIDAR_REAR}")
-    print(f"  LiDARs actifs : {ACTIVE_LIDARS}")
     print(f"  GNSS         : {TOPIC_GNSS}")
     print(f"  FWS          : {TOPIC_FWS}")
     print(f"  Sortie       : {OUTPUT_DIR}")
@@ -1329,20 +844,14 @@ def main():
     _force_gc()
 
     ground, nonground = segment_ground(pcd)
+    del pcd, ground   # sol non utilisé pour le mesh
     _force_gc()
 
     print(f"[INFO] Non-sol : {len(nonground.points):,} points → mesh")
 
-    # ── Phase 4 : construction mesh non sol ──────────────────────────────────────
-    build_mesh(np.asarray(nonground.points).astype(np.float32), OUTPUT_DIR, False)
-    del nonground
-    _force_gc()
-
-    #print(f"[INFO] Sol : {len(ground.points):,} points → mesh")
-
     # ── Phase 4 : construction mesh ──────────────────────────────────────
-    #build_mesh(np.asarray(ground.points).astype(np.float32), OUTPUT_DIR,True)
-    del ground
+    build_mesh(np.asarray(nonground.points).astype(np.float32), OUTPUT_DIR)
+    del nonground
     _force_gc()
 
     # ── Nettoyage checkpoints ────────────────────────────────────────────
