@@ -1,56 +1,53 @@
 import numpy as np
 from typing import Optional
 from scipy.spatial import KDTree
+import open3d as o3d
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DÉSÉRIALISATION PointCloud2 → numpy  (100 % vectorisée)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def fast_pointcloud2_to_xyz(msg) -> Optional[np.ndarray]:
-    """
-    Extraction ultra-rapide des champs XYZ.
-    Utilise les offsets du dtype NumPy pour éviter les slices et les copies manuelles.
-    """
+def fast_pointcloud2_to_xyz(msg):
     n_points = msg.width * msg.height
     if n_points == 0:
         return None
 
-    # 1. On crée un dictionnaire d'offsets pour extraire uniquement X, Y, et Z
-    # On mappe les types ROS (datatype) vers les types NumPy
-    ros_to_numpy_types = {
-        7: '<f4',  # FLOAT32
-        8: '<f8',  # FLOAT64
-    }
+    ros_to_numpy_types = {7: '<f4', 8: '<f8'}
 
     try:
-        # On récupère les types et offsets réels du message
-        fields = {f.name: f for f in msg.fields if f.name in ('x', 'y', 'z')}
+        # 1. Vérification des champs (on passe en minuscule pour être sûr)
+        fields = {f.name.lower(): f for f in msg.fields if f.name.lower() in ('x', 'y', 'z')}
 
-        # Configuration du dtype structuré avec offsets
-        # Cela permet de sauter les octets inutiles (RGB, Intensity, etc.) directement
+        if len(fields) < 3:
+            print(f"Erreur : Champs XYZ manquants. Trouvés : {list(fields.keys())}")
+            return None
+
+        # 2. Configuration du dtype structuré
         dt = np.dtype({
             'names': ['x', 'y', 'z'],
             'formats': [ros_to_numpy_types.get(fields[f].datatype, '<f4') for f in ('x', 'y', 'z')],
             'offsets': [fields[f].offset for f in ('x', 'y', 'z')],
-            'itemsize': msg.point_step  # Crucial : définit la taille totale d'un point
+            'itemsize': msg.point_step
         })
 
-        # 2. Création de la vue (Zero-copy si possible)
-        # Utilisation de memoryview pour éviter toute copie de buffer ROS
+        # 3. Vue mémoire
         data_view = np.frombuffer(msg.data, dtype=dt, count=n_points)
 
-        # 3. Conversion en tableau 2D standard (N, 3)
-        # astype(np.float32) crée une copie propre, indispensable pour les calculs futurs
-        xyz = np.stack([data_view['x'], data_view['y'], data_view['z']], axis=1).astype(np.float32)
+        # 4. Conversion en (N, 3) puis ajout de la colonne de 1 pour l'homogénéité (N, 4)
+        # On extrait d'abord le XYZ
+        xyz = np.zeros((n_points, 4), dtype=np.float32)
+        xyz[:, 0] = data_view['x']
+        xyz[:, 1] = data_view['y']
+        xyz[:, 2] = data_view['z']
+        xyz[:, 3] = 1.0  # La colonne pour la multiplication matricielle @ T.T
 
-        # 4. Filtrage des NaN (Optionnel selon ton besoin)
-        mask = np.isfinite(xyz).all(axis=1)
-        return xyz[mask] if not mask.all() else xyz
+        # 5. Filtrage des NaN
+        mask = np.isfinite(xyz[:, :3]).all(axis=1)
+        return xyz[mask]
 
-    except (KeyError, ValueError):
-        # Fallback ou gestion d'erreur si champs manquants
+    except Exception as e:
+        print(f"Erreur lors de l'extraction PointCloud : {e}")
         return None
-
 
 def _vectorized_fallback_xyz(msg) -> Optional[np.ndarray]:
     """
@@ -109,7 +106,7 @@ def _vectorized_fallback_xyz(msg) -> Optional[np.ndarray]:
 def filter_points_by_distance(xyz: np.ndarray, min_dist: float, max_dist: float) -> np.ndarray:
     # Ton code est déjà optimal ici.
     # On peut juste ajouter une vérification pour éviter de filtrer si les bornes sont infinies.
-    sq = np.einsum('ij,ij->i', xyz, xyz)
+    sq = np.einsum('ij,ij->i', xyz[:,:3], xyz[:,:3])
     mask = (sq >= min_dist ** 2) & (sq <= max_dist ** 2)
     return xyz[mask]
 
@@ -159,3 +156,19 @@ def _scipy_noise_fallback(xyz: np.ndarray, **kwargs) -> np.ndarray:
 
     mask = avg_dists < (mean_dist + std_ratio * std_dist)
     return xyz[mask]
+
+def voxel_filter(xyz: np.ndarray, voxel_size: float = 0.1) -> np.ndarray:
+    """
+    Réduit la densité du nuage de points en ne gardant qu'un point par cube (voxel).
+    voxel_size: taille du cube en mètres (0.1 = 10cm).
+    """
+    if len(xyz) == 0:
+        return xyz
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+
+    # Cette fonction fait tout le travail lourd en C++
+    pcd_downsampled = pcd.voxel_down_sample(voxel_size=voxel_size)
+
+    return np.asarray(pcd_downsampled.points, dtype=np.float32)

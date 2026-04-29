@@ -1,10 +1,11 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, astuple
 from typing import List, Optional, Tuple
 
 import numpy as np
 import sys
 import math
 
+from sklearn import covariance
 
 
 def slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
@@ -42,6 +43,7 @@ class Header:
         print(f"{decalage}   sec : {self.sec}")
         print(f"{decalage}   nanosec : {self.nanosec}")
 
+
 @dataclass
 class Vector3D:
     x: float = 0.0
@@ -52,6 +54,9 @@ class Vector3D:
         print(f"{decalage}x : {self.x}")
         print(f"{decalage}y : {self.y}")
         print(f"{decalage}z : {self.z}")
+
+    def to_list(self):
+        return [self.x, self.y, self.z]
 
 @dataclass
 class Position:
@@ -81,37 +86,87 @@ class Quaternion:
 
 @dataclass
 class PoseWithCovariance:
-    position: Position = Position
-    orientation: Quaternion = Quaternion
+    position: "Position" = field(default_factory=Position)
+    orientation: "Quaternion" = field(default_factory=Quaternion)
     covariance: list[float] = field(default_factory=lambda: [0.0] * 36)
 
-    def printData(self,decalage=""):
+    def printData(self, decalage: str = ""):
         print(f"{decalage}=== PoseWithCovariance ===")
-        self.position.printData(decalage)
-        self.orientation.printData(decalage)
+        self.position.printData(decalage + "  ")
+        self.orientation.printData(decalage + "  ")
         print(f"{decalage}covariance : {self.covariance}")
 
+    @staticmethod
+    def _data_conv_to_array(data: "PoseWithCovariance") -> np.ndarray:
+        if data.position is None or data.orientation is None:
+            raise ValueError("position et orientation ne doivent pas être None")
+
+        return np.array([
+            [data.position.x, data.position.y, data.position.z, 0.0],
+            [data.orientation.x, data.orientation.y, data.orientation.z, data.orientation.w]
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _array_conv_to_data(data: np.ndarray) -> "PoseWithCovariance":
+        if data.shape != (2, 4):
+            raise ValueError("Le tableau doit être de forme (2, 4)")
+
+        return PoseWithCovariance(
+            position=Position(data[0, 0], data[0, 1], data[0, 2]),
+            orientation=Quaternion(data[1, 0], data[1, 1], data[1, 2], data[1, 3]),
+            covariance=[0.0] * 36
+        )
 
 
 @dataclass
 class TwistWithCovariance:
-    linear: Optional[Vector3D] = Vector3D
-    angular: Optional[Vector3D] = Vector3D
+    linear: Optional["Vector3D"] = field(default_factory=Vector3D)
+    angular: Optional["Vector3D"] = field(default_factory=Vector3D)
     covariance: List[float] = field(default_factory=lambda: [0.0] * 36)
 
-    def printData(self,decalage=""):
-        print(f"{decalage}=== FourWheelSteeringStamped ===")
-        self.linear.printData(decalage + "  ")
-        self.angular.printData(decalage + "  ")
+    def printData(self, decalage: str = ""):
+        print(f"{decalage}=== TwistWithCovariance ===")
+
+        if self.linear is not None:
+            self.linear.printData(decalage + "  ")
+        else:
+            print(f"{decalage}  linear: None")
+
+        if self.angular is not None:
+            self.angular.printData(decalage + "  ")
+        else:
+            print(f"{decalage}  angular: None")
+
         print(f"{decalage}covariance : {self.covariance}")
+
+    @staticmethod
+    def _data_conv_to_array(data: "TwistWithCovariance") -> np.ndarray:
+        if data.linear is None or data.angular is None:
+            raise ValueError("linear et angular ne doivent pas être None")
+
+        return np.array([
+            [data.linear.x, data.linear.y, data.linear.z],
+            [data.angular.x, data.angular.y, data.angular.z]
+        ],dtype=np.float32)
+
+    @staticmethod
+    def _array_conv_to_data(data: np.ndarray) -> "TwistWithCovariance":
+        if data.shape != (2, 3):
+            raise ValueError("Le tableau doit être de forme (2, 3)")
+
+        return TwistWithCovariance(
+            linear=Vector3D(data[0, 0], data[0, 1], data[0, 2]),
+            angular=Vector3D(data[1, 0], data[1, 1], data[1, 2]),
+            covariance=[0.0] * 36
+        )
 
 
 @dataclass
 class Odometry:
-    header: Optional[Header] = Header
+    header: Header = field(default_factory=Header)
     child_frame_id: str = ""
-    pose: Optional[PoseWithCovariance] = PoseWithCovariance
-    twist: Optional[TwistWithCovariance] = TwistWithCovariance
+    pose: PoseWithCovariance = field(default_factory=PoseWithCovariance)
+    twist: TwistWithCovariance = field(default_factory=TwistWithCovariance)
 
     def printData(self,decalage=""):
         print(f"{decalage}=== Odometry ===")
@@ -119,9 +174,12 @@ class Odometry:
         print(f"{decalage}   child_frame_id : "+self.child_frame_id)
         self.pose.printData(decalage + "  ")
         self.twist.printData(decalage + "  ")
+
     def deplacement(self, delta):
         self.pose.position.x = self.pose.position.x + self.twist.linear.x * delta
         self.pose.position.y = self.pose.position.y + self.twist.linear.y * delta
+
+
 
 
 @dataclass
@@ -152,6 +210,7 @@ class FourWheelSteeringStamped:
         print(f"{decalage}   speed : {self.speed}")
         print(f"{decalage}   acceleration : {self.acceleration}")
         print(f"{decalage}   jerk : {self.jerk}")
+
 
 class GNSSTrajectory:
     """Position + orientation interpolées depuis PoseWithCovarianceStamped."""
@@ -187,7 +246,9 @@ class GNSSTrajectory:
         self._gnss_speeds[1:] = spd
 
     def interpolate_pose(self, query_ts_ns: int):
-        t  = query_ts_ns * 1e-9
+        query_ts_ns = np.asarray(query_ts_ns).flatten()[0]
+
+        t = query_ts_ns * 1e-9
         ts = self.timestamps
 
         if t < ts[0] or t > ts[-1]:

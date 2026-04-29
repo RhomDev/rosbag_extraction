@@ -61,8 +61,24 @@ if __name__ == '__main__':
 
     print("==== Traitement graphique ====")
 
-    plt.figure()
-    plot_speed(pose_X, pose_Y, "deplacement fwss")
-    #plot_speed(gnss.positions[:, 0], gnss.positions[:, 1], "deplacement gnss")
+    temps = gnss.timestamps - gnss.timestamps[0]  # Pour partir de 0s
+
+    import numpy as np
+    quat_array = np.array([[q.x, q.y, q.z, q.w] for q in gnss.quaternions])
+
+    q_x = quat_array[:, 0]
+    q_y = quat_array[:, 1]
+    q_z = quat_array[:, 2]
+    q_w = quat_array[:, 3]
+
+    plt.plot(temps, q_x, label="Variation de hauteur (x)")
+    plt.plot(temps, q_y, label="Variation de hauteur (y)")
+    plt.plot(temps, q_z, label="Variation de hauteur (z)")
+    plt.plot(temps, q_w, label="Variation de hauteur (w)")
+    plt.xlabel("Temps (s)")
+    plt.ylabel("Altitude (m)")
+    plt.title("Profil altimétrique en fonction du temps")
+    plt.grid(True)
+    plt.legend()
     plt.show()
 

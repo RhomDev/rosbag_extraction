@@ -52,6 +52,17 @@ def _mem_used_gb() -> float:
     except Exception:
         return 0.0
 
+def get_current_ram_gb() -> float:
+    """Lit la RAM réellement utilisée à cet instant (Linux)."""
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # La ligne ressemble à : VmRSS:  123456 kB
+                    kb = float(line.split()[1])
+                    return kb / (1024 ** 2) # Ko -> Go
+    except:
+        return 0.0
 
 def _force_gc():
     """Garbage-collect + libère les pools GPU si disponibles."""
