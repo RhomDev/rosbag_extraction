@@ -3,57 +3,48 @@ import numpy as np
 from tqdm import tqdm
 from typing import Optional
 
+import math
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CINÉMATIQUE 4WS  →  Objet Odometry
 # ═════════════════════════════════════════════════════════════════════════════
 
-def FWSS_by_Odometry(
-        fwss: FourWheelSteeringStamped,
-        delta_t: tuple[float, float],
-        pred: Odometry,
-        current_gnss_z: float = None,
-        current_gnss_yaw: float = None,
-        L: float = 2.5
-) -> Odometry:
+def FWSS_by_Odometry(fwss, delta_t, pred, current_gnss_z=None, current_gnss_yaw=None, L=2.0):
     delta_s = (delta_t[1] - delta_t[0]) / 1_000_000_000.0
     if delta_s <= 0:
         return pred
 
     odom = pred
+    tan_f = math.tan(fwss.front_steering_angle)  # math.tan ~2× plus rapide que np.tan scalaire
+    tan_r = math.tan(fwss.rear_steering_angle)
+    beta  = math.atan((tan_f + tan_r) / 2.0)
 
-    angle_f = fwss.front_steering_angle
-    angle_r = fwss.rear_steering_angle
-
-    beta     = np.arctan((np.tan(angle_f) + np.tan(angle_r)) / 2.0)
-    yaw_rate = (fwss.speed * np.cos(beta) / L) * (np.tan(angle_f) - np.tan(angle_r))
+    yaw_rate = (fwss.speed * math.cos(beta) / L) * (tan_f - tan_r)
     odom.twist.angular.z = yaw_rate
 
-    if not hasattr(odom, 'current_yaw'):
-        odom.current_yaw = 0.0
-
     odom.current_yaw += yaw_rate * delta_s
-
     if current_gnss_yaw is not None:
         odom.current_yaw = current_gnss_yaw
 
-    vx_global = fwss.speed * np.cos(odom.current_yaw + beta)
-    vy_global = fwss.speed * np.sin(odom.current_yaw + beta)
+    cos_yaw_beta = math.cos(odom.current_yaw + beta)
+    sin_yaw_beta = math.sin(odom.current_yaw + beta)
+    vx_global = fwss.speed * cos_yaw_beta
+    vy_global = fwss.speed * sin_yaw_beta
 
     odom.twist.linear.x = vx_global
     odom.twist.linear.y = vy_global
-
     odom.pose.position.x += vx_global * delta_s
     odom.pose.position.y += vy_global * delta_s
-
     if current_gnss_z is not None:
         odom.pose.position.z = current_gnss_z
 
+    half_yaw = odom.current_yaw / 2.0
     odom.pose.orientation.x = 0.0
     odom.pose.orientation.y = 0.0
-    odom.pose.orientation.z = np.sin(odom.current_yaw / 2.0)
-    odom.pose.orientation.w = np.cos(odom.current_yaw / 2.0)
-
+    odom.pose.orientation.z = math.sin(half_yaw)
+    odom.pose.orientation.w = math.cos(half_yaw)
+    odom.deplacement(delta_s)
     return odom
 
 
@@ -61,24 +52,39 @@ def FWSS_by_Odometry(
 # MATRICE DE TRANSFORMATION SE(3) 4×4
 # ═════════════════════════════════════════════════════════════════════════════
 
+def get_transformation_matrix_from_odom(odom: Odometry) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+
+    # Utilisation directe du Yaw calculé par ton odométrie
+    yaw = odom.pose.orientation.z
+    cp, sp = np.cos(yaw), np.sin(yaw)
+
+    # Rotation 2D (Z) + Position
+    T[:3, :3] = [
+        [cp, -sp, 0],
+        [sp, cp, 0],
+        [0, 0, 1]
+    ]
+    T[0, 3] = odom.pose.position.x
+    T[1, 3] = odom.pose.position.y
+    # T[2, 3] = -odom.pose.position.z
+
+    # --- AJOUT DU BRAS DE LEVIER (Extrinsèques) ---
+    # Exemple : LiDAR est à 1.5m à l'avant et 2.0m de haut
+    T_lidar_to_base = np.eye(4)
+    T_lidar_to_base[:3, 3] = [1.5, 0.0, 2.0]
+
+    # La pose réelle des points est : Pose_Robot @ Pose_LiDAR_dans_Robot
+    return T @ T_lidar_to_base
+
 def get_transformation_matrix(
     fwss: FourWheelSteeringStamped,
     delta_t: float,
-    L: float = 2.5,
+    L: float = 1.0,
     dz: float = 0.0,
     q_gnss: Optional[np.ndarray] = None   # [w, x, y, z] depuis interpolate_pose_se3
 ) -> np.ndarray:
-    """
-    Matrice SE(3) 4×4.
 
-    Rotation :
-      - Si q_gnss fourni → R extraite du quaternion GNSS (pitch + roll + yaw réels)
-      - Sinon            → Rz(yaw_4WS) @ Ry(pitch estimé depuis dz/ds), roll = 0
-
-    Translation :
-      - dx, dy : intégration exacte sur arc de cercle (modèle 4WS)
-      - dz     : variation d'altitude réelle depuis GPS
-    """
     delta_t_sec = delta_t / 1_000_000_000.0
     if delta_t_sec <= 0.0:
         return np.eye(4, dtype=np.float64)
@@ -107,8 +113,6 @@ def get_transformation_matrix(
 
     # ── Matrice de rotation ────────────────────────────────────────────────
     if q_gnss is not None:
-        # BUG 3 CORRIGÉ : on utilise le quaternion GNSS complet [w,x,y,z]
-        # → Pitch ET Roll réels issus du capteur GNSS
         w, x, y, z = q_gnss
         R = np.array([
             [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)   ],
@@ -139,63 +143,46 @@ def get_transformation_matrix(
 # ═════════════════════════════════════════════════════════════════════════════
 
 def extraire_FWSS_moving(data_fwss, data_gnss):
-    """
-    Construit la trajectoire uniquement quand le véhicule AVANCE (speed != 0).
-    C'est cette fonction qui doit être appelée pour le mapping LiDAR.
-    """
-    t, odom = [], []
-    T_accumulee = [np.eye(4)]
-
+    timestamps_out, odom_out, T_list = [], [], []
     gnss_helper = GNSSTrajectory(data_gnss)
-
-    time_pred = data_fwss[0][0]
     odom_pred = Odometry()
+    time_pred = data_fwss[0][0]
 
+    # Initialisation Z
     pos_init, _ = gnss_helper.interpolate_pose(time_pred)
     z_pred = pos_init[2] if pos_init is not None else 0.0
 
-    for ts, msg in tqdm(data_fwss, desc="Odométrie 4WS (en mouvement)"):
+    for ts, msg in tqdm(data_fwss, desc="Odométrie"):
         fwss = FourWheelSteeringStamped()
         fwss._conver_MSG(msg)
 
-        # BUG 1 CORRIGÉ : on traite quand speed != 0 (véhicule en mouvement)
-        if fwss.speed != 0 and time_pred != 0:
-            delta_t = ts - time_pred
-
-            # BUG 3 CORRIGÉ : on utilise interpolate_pose_se3 → quaternion complet
+        if fwss.speed != 0:
+            # Interpolation GNSS pour recaler l'altitude et le cap
             pos_curr, q_gnss = gnss_helper.interpolate_pose_se3(ts)
             z_curr = pos_curr[2] if pos_curr is not None else z_pred
-            dz     = z_curr - z_pred
 
-            # Yaw extrait du quaternion pour l'objet Odometry
             yaw_gnss = None
             if q_gnss is not None:
-                import math
-                w, x, y, z_q = q_gnss
-                yaw_gnss = math.atan2(2.0*(w*z_q + x*y), 1.0 - 2.0*(y*y + z_q*z_q))
+                yaw_gnss = math.atan2(2.0 * (q_gnss[0] * q_gnss[3] + q_gnss[1] * q_gnss[2]),
+                                      1.0 - 2.0 * (q_gnss[2] ** 2 + q_gnss[3] ** 2))
 
-            data_out = FWSS_by_Odometry(
-                fwss, (time_pred, ts), odom_pred,
-                current_gnss_z=z_curr,
-                current_gnss_yaw=yaw_gnss
-            )
+            # Un seul calcul d'odométrie par itération
+            data_out = FWSS_by_Odometry(fwss, (time_pred, ts), odom_pred,
+                                        current_gnss_z=z_curr, current_gnss_yaw=yaw_gnss)
 
-            # Matrice avec quaternion complet (pitch + roll + yaw réels)
-            trans_relative = get_transformation_matrix(
-                fwss, delta_t, dz=dz, q_gnss=q_gnss
-            )
+            # Génération de la matrice avec le bras de levier
+            if abs(fwss.speed) < 0.01:
+                T_list.append(T_list[-1])
+            else:
+                T_list.append(get_transformation_matrix_from_odom(data_out))
+            timestamps_out.append(ts)
+            odom_out.append(data_out)
 
-            t.append(ts)
-            odom.append(data_out)
-            T_accumulee.append(T_accumulee[-1] @ trans_relative)
-
-            odom_pred = data_out
-            z_pred    = z_curr
+            odom_pred, z_pred = data_out, z_curr
 
         time_pred = ts
 
-    return t, odom, np.array(T_accumulee)
-
+    return timestamps_out, odom_out, np.array(T_list)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # EXTRACTION ODOMÉTRIE — véhicule À L'ARRÊT  (diagnostic / debug uniquement)

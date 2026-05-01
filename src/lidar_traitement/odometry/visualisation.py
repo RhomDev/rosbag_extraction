@@ -1,8 +1,8 @@
 from PIL.GimpGradientFile import linear
 
-from extraction import extrait_rosbag
+from lidar_traitement.extraction import extrait_rosbag
 import odometry
-from optimisation.utils import Odometry, FourWheelSteeringStamped, GNSSTrajectory
+from lidar_traitement.optimisation.utils import Odometry, FourWheelSteeringStamped, GNSSTrajectory
 import matplotlib.pyplot as plt
 
 BAG = '/home/rhomdev/Documents/stage/bag_files/ez10_gen1_sensors_2026-04-02-16-45-39'
@@ -30,55 +30,74 @@ def save_plot():
 
     plt.savefig(os.path.join(out_dir, f"vitesse_{now}.png"))
 
+
 if __name__ == '__main__':
-    print("==== lANCEMENT DE L ETUDE ODOMETRIE ====")
-    reader,topics_type = extrait_rosbag._open_bag_reader(BAG, TOPIC_LOADING)
+    print("==== LANCEMENT DE L ETUDE ODOMETRIE ====")
+    reader, topics_type = extrait_rosbag._open_bag_reader(BAG, TOPIC_LOADING)
     data_reader = extrait_rosbag._open_bag_extrait(reader, topics_type, TOPIC_LOADING)
 
-    print("==== Traitement des donnée ====")
-    odom = []
+    # 1. Préparer la trajectoire GNSS (Vérité terrain)
+    # GNSSTrajectory attend la liste brute des messages GNSS
+    print("==== Initialisation Trajectoire GNSS ====")
+    gnss_traj = GNSSTrajectory(data_reader[TOPIC_LOADING[1]])
+
+    print("==== Traitement Odométrie (FWSS) ====")
+    # On crée des listes simples pour stocker uniquement les nombres
     pose_X = []
     pose_Y = []
-    t = []
+    t_history = []
+    last_odom = Odometry()  # On garde une trace de l'objet courant
 
-    print("==== Traitement fwss ====")
     for i, (ts, msg) in enumerate(data_reader[TOPIC_LOADING[0]]):
         fwss = FourWheelSteeringStamped()
         fwss._conver_MSG(msg)
 
         if i == 0:
-            data = odometry.FWSS_by_Odometry(fwss, (0.0, ts), Odometry())
-        else:
-            data = odometry.FWSS_by_Odometry(fwss, (t[i-1], ts), odom[i - 1])
+            initial_pos, initial_yaw = gnss_traj.interpolate_pose(ts)
+            if initial_pos is None:
+                initial_pos = gnss_traj.positions[0]
+                initial_yaw = gnss_traj._quat_to_yaw(gnss_traj.quaternions[0])
 
+            last_odom.pose.position.x = initial_pos[0]
+            last_odom.pose.position.y = initial_pos[1]
+            last_odom.current_yaw = initial_yaw
+
+            # On utilise une copie pour le premier calcul
+            data = odometry.FWSS_by_Odometry(fwss, (float(ts), float(ts)), last_odom)
+        else:
+            # On passe l'objet mis à jour au tour précédent
+            data = odometry.FWSS_by_Odometry(fwss, (float(t_history[i - 1]), float(ts)), last_odom)
+
+        # CRUCIAL : On stocke les VALEURS (nombres), pas l'objet entier
         pose_X.append(data.pose.position.x)
         pose_Y.append(data.pose.position.y)
-        t.append(ts)
-        odom.append(data)
+        t_history.append(ts)
+        # On ne fait plus de odom.append(data) pour éviter le bug de référence
 
-    print("==== Traitement gnss ====")
-    gnss = GNSSTrajectory(data_reader[TOPIC_LOADING[1]])
+    # --- PRINTS PROPRES ---
+    print(f"Odom Start : ({pose_X[0]:.4f}, {pose_Y[0]:.4f})")
+    print(f"Odom End   : ({pose_X[-1]:.4f}, {pose_Y[-1]:.4f})")
 
-    print("==== Traitement graphique ====")
+    # Pour le GNSS, on prend les points originaux stockés dans l'objet GNSSTrajectory
+    gnss_x = gnss_traj.positions[:, 0]
+    gnss_y = gnss_traj.positions[:, 1]
 
-    temps = gnss.timestamps - gnss.timestamps[0]  # Pour partir de 0s
+    print(f"GNSS Start : ({gnss_x[0]:.4f}, {gnss_y[0]:.4f})")
+    print(f"GNSS End   : ({gnss_x[-1]:.4f}, {gnss_y[-1]:.4f})")
 
-    import numpy as np
-    quat_array = np.array([[q.x, q.y, q.z, q.w] for q in gnss.quaternions])
+    # 4. Affichage
+    plt.figure(figsize=(12, 8))
+    plt.plot(gnss_x, gnss_y, 'r-', label="GNSS (Vérité terrain)", alpha=0.8)
+    #plt.plot(pose_X, pose_Y, 'b-', label="Odométrie (Modèle FWSS)", linewidth=2)
 
-    q_x = quat_array[:, 0]
-    q_y = quat_array[:, 1]
-    q_z = quat_array[:, 2]
-    q_w = quat_array[:, 3]
+    # Points de départ
+    plt.scatter(gnss_x[0], gnss_y[0], color='green', s=100, label="Départ", zorder=5)
 
-    plt.plot(temps, q_x, label="Variation de hauteur (x)")
-    plt.plot(temps, q_y, label="Variation de hauteur (y)")
-    plt.plot(temps, q_z, label="Variation de hauteur (z)")
-    plt.plot(temps, q_w, label="Variation de hauteur (w)")
-    plt.xlabel("Temps (s)")
-    plt.ylabel("Altitude (m)")
-    plt.title("Profil altimétrique en fonction du temps")
-    plt.grid(True)
+    plt.axis('equal')
+    plt.grid(True, linestyle=':', alpha=0.7)
     plt.legend()
-    plt.show()
+    plt.title("Comparaison de Trajectoire : Modèle Cinématique vs GNSS")
+    plt.xlabel("X [m]")
+    plt.ylabel("Y [m]")
 
+    plt.show()
