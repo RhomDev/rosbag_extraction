@@ -167,12 +167,6 @@ class Odometry:
         self.pose.printData(decalage + "  ")
         self.twist.printData(decalage + "  ")
 
-    def deplacement(self, delta):
-        self.pose.position.x = self.pose.position.x + self.twist.linear.x * delta
-        self.pose.position.y = self.pose.position.y + self.twist.linear.y * delta
-
-
-
 
 @dataclass
 class FourWheelSteeringStamped:

@@ -2,6 +2,7 @@ from lidar_traitement.optimisation.utils import Odometry, FourWheelSteeringStamp
 import numpy as np
 from tqdm import tqdm
 from typing import Optional
+import copy
 
 import math
 
@@ -10,41 +11,71 @@ import math
 # CINÉMATIQUE 4WS  →  Objet Odometry
 # ═════════════════════════════════════════════════════════════════════════════
 
-def FWSS_by_Odometry(fwss, delta_t, pred, current_gnss_z=None, current_gnss_yaw=None, L=2.0):
+def FWSS_by_Odometry(fwss, delta_t, pred, current_gnss_z=None, current_gnss_yaw=None, L=2.8):
+    """
+    Calcule l'odométrie pour un véhicule à 4 roues directrices (4WS).
+    L : Empattement (Wheelbase) -> 2.8m pour EZ10 Gen1/Gen2.
+    """
+    # Conversion du temps en secondes
     delta_s = (delta_t[1] - delta_t[0]) / 1_000_000_000.0
     if delta_s <= 0:
         return pred
 
-    odom = pred
-    tan_f = math.tan(fwss.front_steering_angle)  # math.tan ~2× plus rapide que np.tan scalaire
-    tan_r = math.tan(fwss.rear_steering_angle)
-    beta  = math.atan((tan_f + tan_r) / 2.0)
+    odom = copy.deepcopy(pred)
 
+    # Lecture des angles de braquage
+    tan_f = math.tan(fwss.front_steering_angle)
+    tan_r = math.tan(fwss.rear_steering_angle)
+
+    # 1. Calcul de l'angle de dérive (Slip angle beta) au centre du véhicule
+    # C'est l'angle entre l'axe du châssis et le vecteur vitesse réel
+    beta = math.atan((tan_f + tan_r) / 2.0)
+
+    # 2. Vitesse de lacet (Yaw rate)
+    # On utilise la vitesse des roues projetée sur le vecteur de déplacement du centre
     yaw_rate = (fwss.speed * math.cos(beta) / L) * (tan_f - tan_r)
     odom.twist.angular.z = yaw_rate
 
+    # 3. Mise à jour du Cap (Yaw)
     odom.current_yaw += yaw_rate * delta_s
-    if current_gnss_yaw is not None:
-        odom.current_yaw = current_gnss_yaw
 
+    # Fusion optionnelle avec le GNSS (Idéalement utiliser un lissage/filtre ici)
+    if current_gnss_yaw is not None:
+        print("no data")
+        diff = current_gnss_yaw - odom.current_yaw
+
+        # Normalisation de l'angle entre -pi et pi (très important !)
+        diff = (diff + math.pi) % (2 * math.pi) - math.pi
+
+        # On ne corrige que 1% de l'erreur à chaque frame
+        # Cela permet de garder la fluidité locale (poteau net)
+        # tout en recalant la carte sur le long terme (GNSS).
+        gain = 0.01
+        odom.current_yaw += gain * diff
+
+        # 4. Intégration de la position dans le repère GLOBAL
+    # On déplace le centre du robot selon l'angle (Cap actuel + angle de dérive beta)
     cos_yaw_beta = math.cos(odom.current_yaw + beta)
     sin_yaw_beta = math.sin(odom.current_yaw + beta)
+
     vx_global = fwss.speed * cos_yaw_beta
     vy_global = fwss.speed * sin_yaw_beta
 
-    odom.twist.linear.x = vx_global
-    odom.twist.linear.y = vy_global
     odom.pose.position.x += vx_global * delta_s
     odom.pose.position.y += vy_global * delta_s
+
     if current_gnss_z is not None:
         odom.pose.position.z = current_gnss_z
 
+    # 5. Mise à jour des vitesses locales (Convention ROS)
+    odom.twist.linear.x = fwss.speed * math.cos(beta)
+    odom.twist.linear.y = fwss.speed * math.sin(beta)
+
+    # 6. Conversion Yaw -> Quaternion pour la pose
     half_yaw = odom.current_yaw / 2.0
-    odom.pose.orientation.x = 0.0
-    odom.pose.orientation.y = 0.0
     odom.pose.orientation.z = math.sin(half_yaw)
     odom.pose.orientation.w = math.cos(half_yaw)
-    odom.deplacement(delta_s)
+
     return odom
 
 
@@ -53,29 +84,36 @@ def FWSS_by_Odometry(fwss, delta_t, pred, current_gnss_z=None, current_gnss_yaw=
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_transformation_matrix_from_odom(odom: Odometry) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
+    """
+    Génère la matrice SE(3) 4x4 transformant les points du LiDAR vers le repère MONDE.
+    """
+    T_world_base = np.eye(4, dtype=np.float64)
 
-    # Utilisation directe du Yaw calculé par ton odométrie
-    yaw = odom.pose.orientation.z
+    # Extraction du cap depuis le quaternion (rotation autour de Z uniquement)
+    z = odom.pose.orientation.z
+    w = odom.pose.orientation.w
+    yaw = 2.0 * math.atan2(z, w)
+
     cp, sp = np.cos(yaw), np.sin(yaw)
 
-    # Rotation 2D (Z) + Position
-    T[:3, :3] = [
-        [cp, -sp, 0],
-        [sp, cp, 0],
-        [0, 0, 1]
-    ]
-    T[0, 3] = odom.pose.position.x
-    T[1, 3] = odom.pose.position.y
-    # T[2, 3] = -odom.pose.position.z
+    # Rotation Z
+    T_world_base[0, 0], T_world_base[0, 1] = cp, -sp
+    T_world_base[1, 0], T_world_base[1, 1] = sp, cp
 
-    # --- AJOUT DU BRAS DE LEVIER (Extrinsèques) ---
-    # Exemple : LiDAR est à 1.5m à l'avant et 2.0m de haut
-    T_lidar_to_base = np.eye(4)
-    T_lidar_to_base[:3, 3] = [1.5, 0.0, 2.0]
+    # Translation (Position du robot)
+    T_world_base[0, 3] = odom.pose.position.x
+    T_world_base[1, 3] = odom.pose.position.y
+    T_world_base[2, 3] = odom.pose.position.z
 
-    # La pose réelle des points est : Pose_Robot @ Pose_LiDAR_dans_Robot
-    return T @ T_lidar_to_base
+    # --- OFFSET LIDAR (Extrinsèques) ---
+    # On définit où est le LiDAR par rapport au centre du robot
+    T_base_lidar = np.eye(4)
+
+    T_base_lidar[:3, 3] = [1.5, 0.0, 2.0]
+
+    # La transformation finale est la combinaison des deux :
+    # Points_Monde = T_world_base * T_base_lidar * Points_LiDAR
+    return T_world_base @ T_base_lidar
 
 def get_transformation_matrix(
     fwss: FourWheelSteeringStamped,
@@ -163,8 +201,9 @@ def extraire_FWSS_moving(data_fwss, data_gnss):
 
             yaw_gnss = None
             if q_gnss is not None:
-                yaw_gnss = math.atan2(2.0 * (q_gnss[0] * q_gnss[3] + q_gnss[1] * q_gnss[2]),
-                                      1.0 - 2.0 * (q_gnss[2] ** 2 + q_gnss[3] ** 2))
+                z_curr = pos_curr[2] if pos_curr is not None else z_pred
+                # yaw_gnss = math.atan2(2.0 * (q_gnss[0] * q_gnss[3] + q_gnss[1] * q_gnss[2]),
+                #                       1.0 - 2.0 * (q_gnss[2] ** 2 + q_gnss[3] ** 2))
 
             # Un seul calcul d'odométrie par itération
             data_out = FWSS_by_Odometry(fwss, (time_pred, ts), odom_pred,

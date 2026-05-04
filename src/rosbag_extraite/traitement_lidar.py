@@ -58,6 +58,44 @@ def filter_pointcloud(pc, angle_min_deg=-45, angle_max_deg=45,
     }
 
 
+def read_data_lidar_by_ring(msg):
+    # 1. On lit toutes les données d'un coup, y compris le 'ring'
+    # Utiliser 'reshape' ou 'frombuffer' est plus rapide,
+    # mais read_points reste pratique si on filtre les champs.
+    gen = point_cloud2.read_points(
+        msg,
+        field_names=("x", "y", "z", "intensity", "ring"),
+        skip_nans=True
+    )
+
+    # Conversion efficace en tableau structuré
+    points = np.array(list(gen), dtype=[
+        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('intensity', 'f4'), ('ring', 'u2')
+    ])
+
+    if points.size == 0:
+        return None
+
+    # 2. Séparation par ring
+    # On récupère la liste unique des IDs de lasers présents (0, 1, 2...)
+    unique_rings = np.unique(points['ring'])
+
+    rings_dict = {}
+
+    for r in unique_rings:
+        # Masque pour isoler le ring actuel
+        mask = (points['ring'] == r)
+
+        # On stocke sous forme de dictionnaire ou de tableau Nx3
+        rings_dict[r] = {
+            'x': points['x'][mask],
+            'y': points['y'][mask],
+            'z': points['z'][mask],
+            'intensity': points['intensity'][mask]
+        }
+
+    return rings_dict
+
 def read_data_lidar(msg):
     points = np.fromiter(
         point_cloud2.read_points(
@@ -236,59 +274,43 @@ def generate_video():
 # =========================
 # MAIN
 # =========================
-def main(bag: str, topic_name: str, angle, enhance, video, translation, rotation):
-
+def main(args):
     output_dir = Path("../../out/save_image_lidar")
-    reader, topic_names, type_map = extracte_setup.configuration(bag)
+    shutil.rmtree(output_dir, ignore_errors=True)
+    (output_dir / "face").mkdir(parents=True)
 
-    msg_type = configuration(type_map, topic_name)
-
-    messages = []
-
-    while reader.has_next():
-        topic, data, t = reader.read_next()
-        if topic == topic_name:
-            messages.append((topic, data))
+    reader, _, type_map = extracte_setup.configuration(args.bag)
+    msg_type = get_message(type_map[args.topic])
 
     frame_id = 0
-    start = time.time()
+    start_time = time.time()
 
-    for topic, data in tqdm(messages, desc="Extraction images"):
+    # On ne stocke pas tout en mémoire (messages), on traite au fil de l'eau pour éviter le crash RAM
+    while reader.has_next():
+        topic, data, _ = reader.read_next()
+        if topic != args.topic: continue
 
         msg = deserialize_message(data, msg_type)
-        pc = read_data_lidar(msg)
-        if pc is None:
-            continue
+        pc = read_pc2_fast(msg)
 
-        pc = filter_pointcloud(pc, angle[0], angle[1], 1.0, 30.0)
-        if pc is None:
-            continue
+        # Filtrage
+        pc = filter_pointcloud(pc, args.angle[0], args.angle[1], 1.0, 30.0)
+        if len(pc) == 0: continue
 
-        pc = transform_data(
-            pc,
-            translation[0],translation[1],translation[2],
-            np.deg2rad(rotation[0]),  np.deg2rad(rotation[1]),  np.deg2rad(rotation[2])
-        )
+        # Transformation
+        pts, intensity = transform_data(pc, args.transf_trans, args.transf_rot)
 
-        img = pointcloud_to_image_face(pc, 1280, 720)
+        # Rendu
+        img = pointcloud_to_image_face(pts, intensity, 1280, 720)
 
-        if enhance:
+        if args.enchance:
             img = enhance_lidar_image(img)
 
-        cv2.imwrite(
-            str(output_dir / "face" / f"frame_{frame_id:06d}.png"),
-            img
-        )
-
+        cv2.imwrite(str(output_dir / "face" / f"frame_{frame_id:06d}.png"), img)
         frame_id += 1
 
-    end = time.time()
-
-    print(f"\n{frame_id} images générées en {end - start:.2f}s")
-    print(f"FPS moyen : {frame_id / (end - start):.2f}")
-
-    if video:
-        generate_video()
+    print(f"Terminé. FPS: {frame_id / (time.time() - start_time):.2f}")
+    if args.video: generate_video()
 
 # =========================
 # ENTRYPOINT
@@ -303,7 +325,8 @@ if __name__ == "__main__":
     parser.add_argument("--transf_rot", type=float, nargs=3, default=(15.756, -0.229, 3.908))
     parser.add_argument("--enchance", action="store_true")
     parser.add_argument("--video", action="store_true")
+    parser.add_argument("--ring", action="store_true")
 
     args = parser.parse_args()
 
-    main(args.bag, args.topic, args.angle, args.enchance, args.video, args.transf_trans, args.transf_rot)
+    main(args.bag, args.topic, args.angle, args.enchance, args.video, args.transf_trans, args.transf_rot, args.ring)

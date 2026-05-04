@@ -5,6 +5,7 @@ import argparse
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from lidar_traitement.mesh.lidar_corrections import azimuth_timestamps_from_points, deskew_scan_vectorized
 
 from lidar_traitement.mapping import utils as map_utils
 from lidar_traitement.odometry import odometry
@@ -56,6 +57,127 @@ def _mesh_worker_picklable(xyz):
 
     return vertices, triangles, colors, normals
 
+# ════════════════════════════════════════════════════════════════════
+
+def mesh_one_frame(xyz: np.ndarray, method: str = 'ball_pivoting') -> o3d.geometry.TriangleMesh:
+    """
+    Crée un mesh à partir d'une seule frame/nuage de points.
+    
+    Args:
+        xyz: Points 3D (N, 3)
+        method: 'ball_pivoting', 'poisson', ou 'alpha' (défaut: 'ball_pivoting')
+    
+    Returns:
+        TriangleMesh Open3D
+    """
+    if xyz is None or len(xyz) == 0:
+        print("Erreur : nuage de points vide ou None")
+        return None
+    
+    if method == 'ball_pivoting':
+        mesh = meshing.mesh_style_ball_pivoting(xyz)
+    elif method == 'poisson':
+        mesh = meshing.mesh_style_poisson(xyz)
+    elif method == 'alpha':
+        mesh = meshing.mesh_style_alpha(xyz, alpha=0.1)
+    else:
+        raise ValueError(f"Méthode inconnue : {method}")
+    
+    return mesh
+
+
+def mesh_mapping(xyz_list: list, method: str = 'ball_pivoting', visualize: bool = True) -> o3d.geometry.TriangleMesh:
+    """
+    Crée et combine les meshes de plusieurs frames pour former un mapping global.
+    
+    Args:
+        xyz_list: Liste de nuages de points (chacun de shape (N, 3))
+        method: 'ball_pivoting', 'poisson', ou 'alpha'
+        visualize: Si True, visualise l'évolution du mesh en temps réel
+    
+    Returns:
+        TriangleMesh combiné (mesh global)
+    """
+    if not xyz_list or all(xyz is None or len(xyz) == 0 for xyz in xyz_list):
+        print("Erreur : aucun nuage de points valide")
+        return None
+    
+    meshes = []
+    
+    # Meshing parallèle de chaque frame
+    MAX_WORKERS = min(10, os.cpu_count() or 1)
+    ctx = mp.get_context("spawn")
+    
+    print(f"Meshing {len(xyz_list)} frames avec {MAX_WORKERS} workers...")
+    
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as executor:
+        futures = {executor.submit(_mesh_worker_picklable, xyz): i
+                   for i, xyz in enumerate(xyz_list) if xyz is not None and len(xyz) > 0}
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Meshing"):
+            try:
+                vertices, triangles, colors, normals = future.result()
+                
+                # Reconstruction du mesh Open3D
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices = o3d.utility.Vector3dVector(vertices)
+                mesh.triangles = o3d.utility.Vector3iVector(triangles)
+                
+                if colors is not None and len(colors) > 0:
+                    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+                if normals is not None and len(normals) > 0:
+                    mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+                
+                meshes.append(mesh)
+                
+            except Exception as e:
+                print(f"Erreur meshing : {e}")
+    
+    # Fusion des meshes
+    print("\nFusion des meshes...")
+    final_mesh = o3d.geometry.TriangleMesh()
+    for mesh in meshes:
+        final_mesh += mesh
+    
+    final_mesh.compute_vertex_normals()
+    
+    # Visualisation optionnelle
+    if visualize and len(meshes) > 0:
+        print("Visualisation du mapping en cours...")
+        import time
+        
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="Mapping 3D", width=1280, height=720)
+        
+        display_mesh = o3d.geometry.TriangleMesh()
+        vis.add_geometry(display_mesh)
+        
+        view_initialized = False
+        
+        for i, mesh in enumerate(meshes):
+            display_mesh += mesh
+            display_mesh.compute_vertex_normals()
+            display_mesh.paint_uniform_color([0.6, 0.6, 0.6])
+            
+            vis.update_geometry(display_mesh)
+            
+            if not view_initialized:
+                vis.reset_view_point(True)
+                view_initialized = True
+            
+            vis.poll_events()
+            vis.update_renderer()
+            time.sleep(0.05)
+            
+            if i % max(1, len(meshes) // 10) == 0:
+                print(f"Frame {i}/{len(meshes)} affichée...")
+        
+        print("Fin de la reconstruction. Appuyez sur Q pour fermer.")
+        vis.run()
+        vis.destroy_window()
+    
+    return final_mesh
+
 if __name__ == '__main__':
     print("==== LANCEMENT DE L'ÉTUDE MESHING (GPU) ====")
 
@@ -90,7 +212,17 @@ if __name__ == '__main__':
         if xyz is None or len(xyz) == 0:
             continue
 
-        mesh_tasks.append((xyz, T_mov[idx]))   # ← inchangé ici
+        # Pose précédente pour interpoler le mouvement intra-scan
+        T_prev = T_mov[max(0, idx - 1)]
+        T_curr = T_mov[idx]
+
+        t_pts = azimuth_timestamps_from_points(xyz, ts)
+        xyz = deskew_scan_vectorized(
+            xyz, t_pts, T_prev, T_curr,
+            t_start_ns=ts,
+            t_end_ns=ts + 100_000_000,  # 100 ms @ 10 Hz
+        )
+        mesh_tasks.append((xyz, T_curr))
 
     print(f"Frames valides : {len(mesh_tasks)}")
 
