@@ -228,53 +228,44 @@ def extraire_FWSS_moving(data_fwss, data_gnss):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def extraire_FWSS_move_null(data_fwss, data_gnss):
-    """
-    Traite uniquement les trames où speed == 0.
-    Usage : analyse de la dérive statique, debug — PAS pour le mapping.
-    """
-    t, odom = [], []
-    T_accumulee = [np.eye(4)]
-
+    timestamps_out, odom_out, T_list = [], [], []
     gnss_helper = GNSSTrajectory(data_gnss)
-    time_pred   = data_fwss[0][0]
-    odom_pred   = Odometry()
+    odom_pred = Odometry()
+    time_pred = data_fwss[0][0]
 
+    # Initialisation Z
     pos_init, _ = gnss_helper.interpolate_pose(time_pred)
     z_pred = pos_init[2] if pos_init is not None else 0.0
 
-    for ts, msg in tqdm(data_fwss, desc="Odométrie 4WS (arrêt)"):
+    for ts, msg in tqdm(data_fwss, desc="Odométrie"):
         fwss = FourWheelSteeringStamped()
         fwss._conver_MSG(msg)
 
-        if fwss.speed == 0 and time_pred != 0:
-            delta_t = ts - time_pred
-
+        if fwss.speed == 0:
+            # Interpolation GNSS pour recaler l'altitude et le cap
             pos_curr, q_gnss = gnss_helper.interpolate_pose_se3(ts)
             z_curr = pos_curr[2] if pos_curr is not None else z_pred
-            dz     = z_curr - z_pred
 
             yaw_gnss = None
             if q_gnss is not None:
-                import math
-                w, x, y, z_q = q_gnss
-                yaw_gnss = math.atan2(2.0*(w*z_q + x*y), 1.0 - 2.0*(y*y + z_q*z_q))
+                z_curr = pos_curr[2] if pos_curr is not None else z_pred
+                # yaw_gnss = math.atan2(2.0 * (q_gnss[0] * q_gnss[3] + q_gnss[1] * q_gnss[2]),
+                #                       1.0 - 2.0 * (q_gnss[2] ** 2 + q_gnss[3] ** 2))
 
-            data_out = FWSS_by_Odometry(
-                fwss, (time_pred, ts), odom_pred,
-                current_gnss_z=z_curr,
-                current_gnss_yaw=yaw_gnss
-            )
-            trans_relative = get_transformation_matrix(
-                fwss, delta_t, dz=dz, q_gnss=q_gnss
-            )
+            # Un seul calcul d'odométrie par itération
+            data_out = FWSS_by_Odometry(fwss, (time_pred, ts), odom_pred,
+                                        current_gnss_z=z_curr, current_gnss_yaw=yaw_gnss)
 
-            t.append(ts)
-            odom.append(data_out)
-            T_accumulee.append(T_accumulee[-1] @ trans_relative)
+            # Génération de la matrice avec le bras de levier
+            if abs(fwss.speed) > 0.01:
+                T_list.append(T_list[-1])
+            else:
+                T_list.append(get_transformation_matrix_from_odom(data_out))
+            timestamps_out.append(ts)
+            odom_out.append(data_out)
 
-            odom_pred = data_out
-            z_pred    = z_curr
+            odom_pred, z_pred = data_out, z_curr
 
         time_pred = ts
 
-    return t, odom, np.array(T_accumulee)
+    return timestamps_out, odom_out, np.array(T_list)
