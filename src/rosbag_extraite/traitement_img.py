@@ -45,7 +45,6 @@ def configuration(type_map, topic_names):
 # EXTRACTION
 # =========================
 def extraction(reader, topics, msg_types, save_dirs, clean=False):
-
     messages = []
 
     while reader.has_next():
@@ -53,33 +52,31 @@ def extraction(reader, topics, msg_types, save_dirs, clean=False):
         if topic in topics:
             messages.append((topic, data))
 
-    for topic, data in tqdm(messages, desc="Extraction images"):
-
+    for topic, data in tqdm(messages):
         idx = topics.index(topic)
         msg_type = msg_types[idx]
 
+        # Désérialisation immédiate
         msg = deserialize_message(data, msg_type)
 
         try:
             cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-
             stamp = msg.header.stamp
 
-            if clean:
-                filename = os.path.join(
-                    save_dirs[idx],
-                    f"image_{stamp.sec}_{stamp.nanosec}.jpg"
-                )
+            # Formatage du nom de fichier
+            if not clean:
+                # On garde les nanosecondes pour la précision du clean
+                filename = f"image_{stamp.sec}_{stamp.nanosec:09d}.jpg"
             else:
-                filename = os.path.join(
-                    save_dirs[idx],
-                    f"image_{stamp.sec}.jpg"
-                )
+                filename = f"image_{stamp.sec}.jpg"
 
-            cv2.imwrite(filename, cv_img)
+            path = os.path.join(save_dirs[idx], filename)
+            cv2.imwrite(path, cv_img)
 
-        except CvBridgeError as e:
-            print(f"[CvBridgeError] {e}")
+        except Exception as e:
+            print(f"Erreur sur le topic {topic}: {e}")
+
+    print(f"Extraction terminée : {len(messages)} images enregistrées.")
 
 
 # =========================
@@ -101,20 +98,17 @@ def clean(save_dirs):
 # MAIN
 # =========================
 def main(bag, clean_mode):
+    print("========= Traitement Image ==========")
+    print("Configuration de l'image")
+    reader, topic_names, type_map = extracte_setup.configuration(bag)
+    topics, msg_types, save_dirs = configuration(type_map, topic_names)
 
-    steps = ["Config", "Extract", "Clean"]
+    print("extraction des images")
+    extraction(reader, topics, msg_types, save_dirs, clean_mode)
 
-    for step in tqdm(steps, desc="Pipeline", ncols=80):
-
-        if step == "Config":
-            reader, topic_names, type_map = extracte_setup.configuration(bag)
-            topics, msg_types, save_dirs = configuration(type_map, topic_names)
-
-        elif step == "Extract":
-            extraction(reader, topics, msg_types, save_dirs, clean_mode)
-
-        elif step == "Clean" and clean_mode:
-            clean(save_dirs)
+    if clean_mode:
+        print("synchronisation des images")
+        clean(save_dirs)
 
 
 # =========================

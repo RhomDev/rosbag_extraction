@@ -83,10 +83,10 @@ def plot_speed(timestamps, speeds):
 def save_plot():
     now = datetime.datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 
-    out_dir = "../../out/save"
+    out_dir = "../../out/save_vitesse_odometry"
     os.makedirs(out_dir, exist_ok=True)
 
-    plt.savefig(os.path.join(out_dir, f"vitesse_{now}.png"))
+    plt.savefig(os.path.join(out_dir, f"vitesse_{now}_odometry.png"))
 
 
 # =========================
