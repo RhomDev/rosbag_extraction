@@ -133,7 +133,7 @@ def _video_writer_thread(video_path, vid_w, vid_h, fps, frame_queue, total):
 # ════════════════════════════════════════════════════════════════════
 
 def main(args):
-    root      = Path("../../../out/save_img_mesh_lidar")
+    root      = Path("../out/save_img_mesh_lidar")
     img_dir   = root / "images"
     video_dir = root / "video"
     mesh_dir  = root / "mesh"
